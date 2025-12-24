@@ -1,15 +1,13 @@
 import streamlit as st
 import ultimate_football_bot as bot
 
-st.set_page_config(page_title="Protipp Bot", page_icon="💰")
-st.title("🏆 czunidaniel9 Kupa & Bajnoki Elemző")
+st.set_page_config(page_title="2.00 Odds Bot", page_icon="💰")
+st.title("🏆 czunidaniel9 Duplázó Rendszer")
 
-st.warning("⚠️ Figyelem: A kupameccseken a kiscsapatok felszívják magukat! A bot ezt is figyeli.")
-
-if st.button("Kérem az elemzést (Gól, Szöglet, Lap, Bíró)"):
-    with st.spinner('Adatok gyűjtése...'):
+if st.button("Kérem a mai 2.00-ás szelvényt"):
+    with st.spinner('Adatok és pletykák elemzése...'):
         siker = bot.ultimate_football_bot()
         if siker:
-            st.success("✅ A részletes stratégia elment a czunidaniel9@gmail.com-ra!")
+            st.success("✅ A szelvény (1000 -> 2000 Ft) elküldve az e-mailedre!")
         else:
-            st.error("❌ Hiba! Ellenőrizd a beállításokat!")
+            st.error("❌ Hiba! Ellenőrizd a Secrets beállításokat!")
