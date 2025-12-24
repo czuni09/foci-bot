@@ -1,18 +1,15 @@
 import streamlit as st
 import ultimate_football_bot as bot
 
-st.title("⚽ czunidaniel9 Foci Bot")
-st.write("A rendszer minden nap 10:00-kor küld e-mailt.")
+st.set_page_config(page_title="Pro Foci Bot", page_icon="⚽")
+st.title("🏆 czunidaniel9 Profi Tippadó")
 
-if st.button("Teszt elemzés indítása most"):
-    st.write("Elemzés és e-mail küldés folyamatban...")
-    h = bot.TeamStats("Arsenal")
-    v = bot.TeamStats("Crystal Palace")
-    
-    # Itt ellenőrizzük, hogy a küldés sikeres volt-e
-    siker = bot.ultimate_football_bot(h, v, "London", "PL", 1.5, 80)
-    
-    if siker:
-        st.success("✅ Kész! Az e-mail sikeresen elment!")
-    else:
-        st.error("❌ Hiba! Az e-mail küldése nem sikerült. Ellenőrizd a jelszót (Secret)!")
+st.info("A bot elemzi a bírót, az időjárást és a csapatok formáját.")
+
+if st.button("Kérem a mai biztos tippeket"):
+    with st.spinner('Elemzés futtatása...'):
+        siker = bot.ultimate_football_bot()
+        if siker:
+            st.success("✅ A pontos tippek (lapok, szögletek, nyertes) elküldve az e-mailedre!")
+        else:
+            st.error("❌ Hiba történt. Ellenőrizd az API kulcsokat!")
