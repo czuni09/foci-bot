@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 from datetime import datetime, timedelta, timezone
 
-# --- CONFIGURATION & SECURITY ---
+# --- BIZTONSÁG ---
 try:
     ODDS_API_KEY = st.secrets["ODDS_API_KEY"]
     WEATHER_KEY = st.secrets["WEATHER_API_KEY"]
@@ -10,17 +10,16 @@ except KeyError as e:
     st.error(f"Kritikus hiba: Hiányzó API kulcs: {e}")
     st.stop()
 
-class FootballIntelligenceV53:
+class FootballIntelligenceV531:
     """
-    Hardened V5.3 PRO: Rögzített favorit-logika, hiba-ellenálló piac-kezelés.
+    V5.3.1 Hardened PRO: Teljes árverseny minden kimenetre + Optimalizált erőforrás-kezelés.
     """
     def __init__(self):
         self.base_url = "https://api.the-odds-api.com/v4/sports"
         self.TARGET_ODDS = 1.50
 
     def get_weather(self, city, kickoff_time):
-        if not city:
-            return "Város nem meghatározható (időjárás kihagyva)"
+        """Időjárás lekérése csak ha a helyszín ismert."""
         try:
             url = f"http://api.openweathermap.org/data/2.5/forecast?q={city}&appid={WEATHER_KEY}&units=metric"
             res = requests.get(url, timeout=5)
@@ -65,44 +64,40 @@ class FootballIntelligenceV53:
 
                     match_id = f"{m['home_team']}|{m['away_team']}|{m['commence_time']}"
                     
-                    # 1) Ajánlatok begyűjtése a kijelölt bookie-któl
+                    # V5.3.1: Minden kimenet begyűjtése az árversenyhez
                     offers = []
                     for bookie in m.get('bookmakers', []):
                         if bookie.get('key') not in ['pinnacle', 'bet365', 'unibet']:
                             continue
 
-                        # FIX (3): mkt.get("key") biztonságos keresés
                         h2h = next((mk for mk in bookie.get("markets", []) if mk.get("key") == "h2h"), None)
                         if not h2h: continue
 
                         outcomes = h2h.get("outcomes", [])
-                        if not outcomes: continue
-
-                        # Favorit keresése az adott bookie-nál
-                        fav = min(outcomes, key=lambda x: float(x.get("price", 999)))
-                        offers.append({
-                            "pick": fav.get("name"),
-                            "odds": float(fav.get("price", 999))
-                        })
+                        for o in outcomes:
+                            name = o.get("name")
+                            price = float(o.get("price", 999))
+                            if name and price < 900:
+                                offers.append({"pick": name, "odds": price})
 
                     if not offers:
                         continue
 
-                    # FIX (2): Globális favorit rögzítése (legkisebb odds alapján)
+                    # Globális favorit rögzítése a teljes kínálat alapján
                     global_fav_pick = min(offers, key=lambda o: o["odds"])["pick"]
                     
-                    # Stratégiai szűrés: a favorit minimum ára a tartományban legyen
+                    # Szűrés: a favorit minimum ára a tartományban legyen (1.35 - 1.65)
                     global_min_price = min(o["odds"] for o in offers if o["pick"] == global_fav_pick)
                     
                     if 1.35 <= global_min_price <= 1.65:
-                        # Legjobb ár keresése szigorúan a rögzített kimenetre (pick)
+                        # V5.3.1: Valódi BEST PRICE keresés a rögzített kimenetre
                         best_price = max(o["odds"] for o in offers if o["pick"] == global_fav_pick)
                         
                         picks_by_match[match_id] = {
                             'match': f"{m['home_team']} vs {m['away_team']}",
                             'home': m['home_team'],
                             'away': m['away_team'],
-                            'venue': None, # FIX (1): Amíg nincs város API, None
+                            'venue': None, # Jelenleg nincs város API
                             'pick': global_fav_pick,
                             'odds': best_price,
                             'kickoff': kickoff,
@@ -115,12 +110,12 @@ class FootballIntelligenceV53:
         return list(picks_by_match.values())
 
 # --- UI ---
-st.set_page_config(page_title="Strategic PRO V5.3", page_icon="⚽", layout="wide")
-st.title("🛡️ Strategic Football Intelligence V5.3 PRO")
+st.set_page_config(page_title="Strategic PRO V5.3.1", page_icon="⚽", layout="wide")
+st.title("🛡️ Strategic Football Intelligence V5.3.1")
 
-if st.button("🚀 OPTIMÁLIS DUPLÁZÓ GENERÁLÁSA", type="primary"):
-    bot = FootballIntelligenceV53()
-    with st.spinner("Piacok elemzése és favorit-szűrés..."):
+if st.button("🚀 MAI OPTIMÁLIS DUPLÁZÓ GENERÁLÁSA", type="primary"):
+    bot = FootballIntelligenceV531()
+    with st.spinner("Globális árverseny és piaci szűrés..."):
         data = bot.analyze_markets()
         
         if len(data) >= 2:
@@ -129,14 +124,12 @@ if st.button("🚀 OPTIMÁLIS DUPLÁZÓ GENERÁLÁSA", type="primary"):
             p1 = data[0]
             p2 = None
             
-            # FIX (5): Korreláció-szűrés + csapat-duplikáció elleni védelem
             for candidate in data[1:]:
-                time_diff = abs((candidate['kickoff'] - p1['kickoff']).total_seconds()) / 60
-                # Ne legyen ugyanaz a csapat (anomália védelem)
                 teams_p1 = {p1['home'], p1['away']}
                 teams_cand = {candidate['home'], candidate['away']}
                 
                 if not teams_p1.intersection(teams_cand):
+                    time_diff = abs((candidate['kickoff'] - p1['kickoff']).total_seconds()) / 60
                     if time_diff > 60 or candidate['league'] != p1['league']:
                         p2 = candidate
                         break
@@ -148,14 +141,14 @@ if st.button("🚀 OPTIMÁLIS DUPLÁZÓ GENERÁLÁSA", type="primary"):
                 c1, c2 = st.columns(2)
                 for idx, p in enumerate([p1, p2]):
                     with [c1, c2][idx]:
-                        # FIX (1): Időjárás csak ha van venue
-                        weather = bot.get_weather(p['venue'], p['kickoff'])
+                        # V5.3.1 optimalizált hívás: csak ha van helyszín
+                        weather = "Város nem meghatározható (kihagyva)" if not p['venue'] else bot.get_weather(p['venue'], p['kickoff'])
                         st.info(f"**{p['match']}**")
-                        st.write(f"Tipp: **{p['pick']}** | Odds: **{p['odds']}**")
+                        st.write(f"Tipp: **{p['pick']}** | Szorzó: **{p['odds']}**")
                         st.write(f"⏰ {p['kickoff'].strftime('%m-%d %H:%M')} | ☁️ {weather}")
                 
                 st.divider()
-                st.metric("Bankroll Mennyiség", "2% (Konzervatív)")
+                st.metric("Javasolt Tét", "Bankroll 2%-a")
             else:
                 st.warning("Nem sikerült korrelációmentes párost találni.")
         else:
