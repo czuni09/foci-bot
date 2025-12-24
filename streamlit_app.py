@@ -6,19 +6,16 @@ from datetime import datetime, timedelta, timezone
 try:
     ODDS_API_KEY = st.secrets["ODDS_API_KEY"]
     WEATHER_KEY = st.secrets["WEATHER_API_KEY"]
-    # Opcionális kulcsok
-    NEWS_API_KEY = st.secrets.get("NEWS_API_KEY", "")
 except KeyError:
-    st.error("Hiba: Hiányzó kulcsok! Ellenőrizd a Streamlit Secrets beállításait (ODDS_API_KEY, WEATHER_API_KEY).")
+    st.error("Hiba: Hiányzó kulcsok! Ellenőrizd a Streamlit Cloud Secrets beállításait (ODDS_API_KEY, WEATHER_API_KEY).")
     st.stop()
 
 class FootballIntelligenceProV5:
     def __init__(self):
         self.base_url = "https://api.the-odds-api.com/v4/sports"
-        self.TARGET_ODDS = 1.50 # Stratégiai cél: 1.50 * 1.50 = ~2.25 eredő
+        self.TARGET_ODDS = 1.50 
 
     def get_weather(self, city, kickoff_time):
-        """Időjárás előrejelzés lekérése a megadott kulccsal"""
         if not city: return "Helyszín ismeretlen"
         try:
             url = f"http://api.openweathermap.org/data/2.5/forecast?q={city}&appid={WEATHER_KEY}&units=metric"
@@ -30,7 +27,19 @@ class FootballIntelligenceProV5:
                         return f"{f['main']['temp']:.1f}°C, {f['weather'][0]['description']}"
             return "Nincs közeli előrejelzés"
         except:
-            return "Időjárás adat nem elérhető"
+            return "Időjárás nem elérhető"
 
     @st.cache_data(ttl=3600)
-    def discover_soccer_
+    def discover_soccer_leagues(_self):
+        """Dinamikus ligafelfedezés - fix _self paraméterrel"""
+        try:
+            res = requests.get(f"{_self.base_url}?apiKey={ODDS_API_KEY}")
+            res.raise_for_status()
+            return [s['key'] for s in res.json() if s['group'] == 'Soccer']
+        except:
+            return ['soccer_epl', 'soccer_spain_la_liga', 'soccer_germany_bundesliga', 'soccer_italy_serie_a']
+
+    def analyze_markets(self):
+        leagues = self.discover_soccer_leagues()
+        picks_by_match = {} 
+        now =
