@@ -1,55 +1,58 @@
-import datetime
+import os
 import requests
 import smtplib
-import os
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from dataclasses import dataclass, field
-from typing import List, Tuple
 
-# API KULCSOK - A GitHub Secrets-ből jönnek
-WEATHER_KEY = os.environ.get("WEATHER_KEY", "c31a011d35fed1b4d7b9f222c99d6dd2")
-NEWS_KEY = os.environ.get("NEWS_KEY", "7d577a4d9f2b4ba38541cc3f7e5ad6f5")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
+# --- TITKOK BEOLVASÁSA ---
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "agbuyzyegfaokhhu")
+FOOTBALL_KEY = os.environ.get("FOOTBALL_DATA_KEY") # Ezt add hozzá a Secrets-hez!
+WEATHER_KEY = "c31a011d35fed1b4d7b9f222c99d6dd2"
 SAJAT_EMAIL = "czunidaniel9@gmail.com"
 
-@dataclass
-class TeamStats:
-    name: str
-    injuries: List[str] = field(default_factory=list)
-    intl_absences: List[str] = field(default_factory=list)
+def get_mai_meccsek():
+    if not FOOTBALL_KEY:
+        return "Nincs Football API kulcs beállítva."
+    
+    url = "https://api.football-data.org/v4/matches"
+    headers = {'X-Auth-Token': FOOTBALL_KEY}
+    
+    try:
+        response = requests.get(url, headers=headers)
+        data = response.json()
+        meccsek = data.get('matches', [])
+        
+        if not meccsek:
+            return "Ma nincs kiemelt mérkőzés a rendszerben."
+        
+        riport = "⚽ MAI KIEMELT MECCSEK ÉS TIPPEK:\n\n"
+        for m in meccsek[:5]: # Az első 5 meccs
+            hazai = m['homeTeam']['name']
+            vendeg = m['awayTeam']['name']
+            bajnoksag = m['competition']['name']
+            riport += f"🏆 {bajnoksag}: {hazai} vs {vendeg}\n"
+        return riport
+    except:
+        return "Hiba történt az adatok lekérésekor."
 
-def kuldj_emailt(targy, tartalom):
-    if not GMAIL_APP_PASSWORD:
-        print("HIBA: Hiányzik a GMAIL_APP_PASSWORD!")
-        return
+def kuldj_jelentes(tartalom):
     msg = MIMEMultipart()
     msg['From'] = SAJAT_EMAIL
     msg['To'] = SAJAT_EMAIL
-    msg['Subject'] = targy
+    msg['Subject'] = "Napi Foci Jelentés - Éles Adatok"
     msg.attach(MIMEText(tartalom, 'plain', 'utf-8'))
+
     try:
         server = smtplib.SMTP('smtp.gmail.com', 587)
         server.starttls()
         server.login(SAJAT_EMAIL, GMAIL_APP_PASSWORD)
         server.send_message(msg)
         server.quit()
-        print("E-mail elküldve!")
+        return True
     except Exception as e:
         print(f"Hiba: {e}")
-
-def ultimate_football_bot(home, away, varos, bajnoksag, odds, alap_esely):
-    esely = float(alap_esely)
-    # Egyszerűsített számítás a teszthez
-    if home.injuries or home.intl_absences: esely -= 5
-    
-    szoveg = f"⚽ ELEMZÉS: {home.name} - {away.name}\n"
-    szoveg += f"Esély: {esely}%\nJavaslat: "
-    szoveg += "FOGADÁS" if esely >= 75 else "KERÜLD"
-    
-    kuldj_emailt(f"Foci Tipp: {home.name} ({esely}%)", szoveg)
+        return False
 
 if __name__ == "__main__":
-    h = TeamStats("Arsenal", intl_absences=["Partey"])
-    v = TeamStats("Crystal Palace", intl_absences=["Ayew"])
-    ultimate_football_bot(h, v, "London", "Premier League", 1.48, 80)
+    mai_adatok = get_mai_meccsek()
+    kuldj_jelentes(mai_adatok)
