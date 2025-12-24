@@ -10,53 +10,44 @@ FOOTBALL_KEY = os.environ.get("FOOTBALL_DATA_KEY")
 WEATHER_KEY = "c31a011d35fed1b4d7b9f222c99d6dd2"
 SAJAT_EMAIL = "czunidaniel9@gmail.com"
 
-def get_biro_statisztika(biro_nev):
-    # Itt szimuláljuk a bírói szigorúságot, mivel az ingyenes API korlátozott
-    # Egy valódi adatbázisból itt jönne a sárga lapok átlaga
-    szigorusag = "Közepes"
-    if biro_nev:
-        return f"Bíró: {biro_nev} (Várható lapok: {szigorusag})"
-    return "Bírói adatok nem elérhetőek."
-
-def tipp_generalas(home_rank, away_rank, weather_temp):
-    # Logikai döntéshozatal a fogadáshoz
-    if home_rank < away_rank - 5:
-        return "🔥 TIPP: Hazai győzelem (1) + Szögletek: Over 8.5"
-    elif weather_temp < 5:
-        return "❄️ TIPP: Kevés gól (Under 2.5) a hideg miatt + Lapok: Over 3.5"
-    else:
-        return "⚖️ TIPP: Dupla esély (1X) + Mindkét csapat szerez gólt (BTTS)"
+def elemzes_es_tipp(hazai, vendeg, temp, biro):
+    # Kupa-faktor és meglepetés esélye
+    tipp = f"📊 ELEMZÉS: {hazai} vs {vendeg}\n"
+    tipp += f"👨‍⚖️ Bíró: {biro} -> Várható lapok: " + ("MAGAS (Over 4.5)" if "Oliver" in biro or "Taylor" in biro else "Normál (2-4)") + "\n"
+    
+    # Fogadási stratégia a listád alapján
+    tipp += "💰 PONTOS TIPPEK:\n"
+    tipp += "- FŐ TIPP: Dupla esély (1X) vagy Döntetlen (X) - a kupa-faktor miatt!\n"
+    tipp += f"- GÓLOK: " + ("Under 2.5" if temp < 5 else "Over 2.5") + " (Időjárás: " + str(temp) + "°C)\n"
+    tipp += "- SZÖGLETEK: Hazai csapat támadni fog -> Over 9.5 összesen\n"
+    tipp += "- SPECIÁLIS: Mindkét csapat szerez gólt (BTTS): IGEN\n"
+    return tipp
 
 def get_adatok():
     headers = {'X-Auth-Token': FOOTBALL_KEY} if FOOTBALL_KEY else {}
-    riport = "🎯 PROFESSZIONÁLIS FOGADÁSI ELEMZÉS 🎯\n\n"
+    riport = "🎯 PROFI FOGADÁSI STRATÉGIA ÉS BÍRÓI JELENTÉS 🎯\n\n"
     
     try:
-        # Időjárás lekérése
         w_res = requests.get(f"http://api.openweathermap.org/data/2.5/weather?q=London&appid={WEATHER_KEY}&units=metric")
         temp = w_res.json()['main']['temp']
-        riport += f"🌡️ Helyszíni hőmérséklet: {temp}°C\n"
-    except: temp = 15
+    except: temp = 10
 
     try:
         f_res = requests.get("https://api.football-data.org/v4/matches", headers=headers)
-        meccsek = f_res.json().get('matches', [])
+        data = f_res.json()
+        meccsek = data.get('matches', [])
         
         if meccsek:
             for m in meccsek[:3]:
-                hazai = m['homeTeam']['name']
-                vendeg = m['awayTeam']['name']
-                biro = m.get('referees', [{}])[0].get('name', 'Ismeretlen')
-                
-                riport += f"\n⚽ MÉRKŐZÉS: {hazai} - {vendeg}\n"
-                riport += f"👨‍⚖️ {get_biro_statisztika(biro)}\n"
-                # Példa rangsor (mivel az API-ból a tabella külön kérés)
-                riport += f"📝 ELEMZÉS: {tipp_generalas(1, 10, temp)}\n"
-                riport += "--------------------------------------\n"
+                h_nev = m['homeTeam']['name']
+                v_nev = m['awayTeam']['name']
+                biro_nev = m.get('referees', [{}])[0].get('name', 'Ismeretlen bíró')
+                riport += elemzes_es_tipp(h_nev, v_nev, temp, biro_nev)
+                riport += "\n" + "="*40 + "\n"
         else:
-            riport += "\nMa nincs kiemelt elemzésre váró mérkőzés.\n"
-    except:
-        riport += "\nHiba az adatok lekérésekor.\n"
+            riport += "Ma nincs elemzésre váró kiemelt kupa/bajnoki meccs.\n"
+    except Exception as e:
+        riport += f"Hiba az adatoknál: {e}\n"
         
     return riport
 
@@ -65,7 +56,7 @@ def ultimate_football_bot():
     msg = MIMEMultipart()
     msg['From'] = SAJAT_EMAIL
     msg['To'] = SAJAT_EMAIL
-    msg['Subject'] = "🎯 Napi Fix Tippek és Bírói Elemzés"
+    msg['Subject'] = "🔥 PONTOS TIPPEK: Meccs, Szöglet, Lapok"
     msg.attach(MIMEText(tartalom, 'plain', 'utf-8'))
 
     try:
