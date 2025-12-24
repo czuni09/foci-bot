@@ -1,0 +1,24 @@
+name: Napi Foci Jelentés
+on:
+  schedule:
+    # Ez minden nap reggel 10:00-kor fut le (magyar idő szerint)
+    - cron: '0 9 * * *'
+  workflow_dispatch: # Lehetővé teszi a kézi indítást is teszteléshez
+
+jobs:
+  run-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Python beállítása
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Függőségek telepítése
+        run: pip install requests
+      - name: Bot futtatása
+        run: python ultimate_football_bot.py
+        env:
+          # Itt használja a kódodban lévő API kulcsokat
+          WEATHER_KEY: ${{ secrets.WEATHER_KEY }}
+          NEWS_KEY: ${{ secrets.NEWS_KEY }}
