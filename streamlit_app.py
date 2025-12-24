@@ -1,13 +1,15 @@
 import streamlit as st
 import ultimate_football_bot as bot
 
-st.set_page_config(page_title="2.00 Odds Bot", page_icon="💰")
-st.title("🏆 czunidaniel9 Duplázó Rendszer")
+st.set_page_config(page_title="Protipp Debug", page_icon="🛠️")
+st.title("🏆 Duplázó Bot - Hibakezelő Üzemmód")
 
-if st.button("Kérem a mai 2.00-ás szelvényt"):
-    with st.spinner('Adatok és pletykák elemzése...'):
-        siker = bot.ultimate_football_bot()
+if st.button("Kérem az elemzést"):
+    with st.spinner('Adatok lekérése és ellenőrzése...'):
+        siker, uzenet = bot.ultimate_football_bot()
+        
         if siker:
-            st.success("✅ A szelvény (1000 -> 2000 Ft) elküldve az e-mailedre!")
+            st.success(f"✅ {uzenet}")
         else:
-            st.error("❌ Hiba! Ellenőrizd a Secrets beállításokat!")
+            st.error(f"❌ {uzenet}")
+            st.info("Tipp: Ellenőrizd a Streamlit Secrets beállításokat!")
