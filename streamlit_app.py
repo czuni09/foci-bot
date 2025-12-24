@@ -1,21 +1,19 @@
 import streamlit as st
 import ultimate_football_bot as bot
 
-st.set_page_config(page_title="Data Football Pro", page_icon="📈")
+st.set_page_config(page_title="Odds-Master Pro", page_icon="📈")
 
-# KÉP MEGJELENÍTÉSE
-st.image("https://images.unsplash.com/photo-1574629810360-7efbbe195018?q=80&w=1000", 
-         caption="Adatvezérelt Labdarúgó Analitika", use_container_width=True)
+st.image("https://images.unsplash.com/photo-1518152006812-edab29b069ac?q=80&w=1000", 
+         caption="Élő Odds Elemzés és Valószínűség-számítás", use_container_width=True)
 
-st.title("⚽ czunidaniel9 Pro Elemző")
+st.title("🏆 czunidaniel9 Smart Bet")
+st.write("Ez a bot már valós piaci oddsokat elemez az Odds-API segítségével.")
 
-st.info("Ez a rendszer OOP alapú hibakezelést és liga-súlyozott pontozást használ.")
-
-if st.button("🚀 Stratégiai Elemzés Futtatása"):
-    with st.spinner('Adatok lekérése az API-ból és pontozás...'):
-        siker, uzenet = bot.run_analysis_and_send()
+if st.button("🔥 MAI ODDS-VADÁSZAT INDÍTÁSA"):
+    with st.spinner('Keresem a legjobb 2.00-ás szorzókat a bukiknál...'):
+        siker, uzenet = bot.run()
         if siker:
             st.success(uzenet)
             st.balloons()
         else:
-            st.error(f"Hiba: {uzenet}")
+            st.error(uzenet)
