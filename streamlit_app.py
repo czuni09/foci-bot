@@ -1,15 +1,15 @@
 import streamlit as st
 import ultimate_football_bot as bot
 
-st.set_page_config(page_title="Pro Foci Bot", page_icon="⚽")
-st.title("🏆 czunidaniel9 Profi Tippadó")
+st.set_page_config(page_title="Protipp Bot", page_icon="💰")
+st.title("🏆 czunidaniel9 Kupa & Bajnoki Elemző")
 
-st.info("A bot elemzi a bírót, az időjárást és a csapatok formáját.")
+st.warning("⚠️ Figyelem: A kupameccseken a kiscsapatok felszívják magukat! A bot ezt is figyeli.")
 
-if st.button("Kérem a mai biztos tippeket"):
-    with st.spinner('Elemzés futtatása...'):
+if st.button("Kérem az elemzést (Gól, Szöglet, Lap, Bíró)"):
+    with st.spinner('Adatok gyűjtése...'):
         siker = bot.ultimate_football_bot()
         if siker:
-            st.success("✅ A pontos tippek (lapok, szögletek, nyertes) elküldve az e-mailedre!")
+            st.success("✅ A részletes stratégia elment a czunidaniel9@gmail.com-ra!")
         else:
-            st.error("❌ Hiba történt. Ellenőrizd az API kulcsokat!")
+            st.error("❌ Hiba! Ellenőrizd a beállításokat!")
