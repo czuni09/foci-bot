@@ -1,24 +1,30 @@
 name: Napi Foci Jelentés
 on:
   schedule:
-    # Ez minden nap reggel 10:00-kor fut le (magyar idő szerint)
+    # Minden nap reggel 10:00-kor fut le (magyar idő szerint)
+    # Az UTC 09:00 felel meg a magyar 10:00-nak
     - cron: '0 9 * * *'
-  workflow_dispatch: # Lehetővé teszi a kézi indítást is teszteléshez
+  workflow_dispatch: # Ez gombot hoz létre, amivel bármikor elindíthatod kézzel tesztelni
 
 jobs:
   run-analysis:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - name: Python beállítása
+      - name: Kód letöltése a GitHubról
+        uses: actions/checkout@v3
+
+      - name: Python környezet beállítása
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-      - name: Függőségek telepítése
+
+      - name: Szükséges összetevők telepítése
         run: pip install requests
-      - name: Bot futtatása
+
+      - name: Bot futtatása és e-mail küldése
         run: python ultimate_football_bot.py
         env:
-          # Itt használja a kódodban lévő API kulcsokat
+          # Itt adjuk át a GitHubon beállított titkos kulcsokat a programnak
           WEATHER_KEY: ${{ secrets.WEATHER_KEY }}
           NEWS_KEY: ${{ secrets.NEWS_KEY }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
