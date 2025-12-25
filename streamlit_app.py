@@ -153,3 +153,4 @@ if st.button("🚀 MAI OPTIMÁLIS DUPLÁZÓ GENERÁLÁSA", type="primary"):
                 st.warning("Nem sikerült korrelációmentes párost találni.")
         else:
             st.error("Nincs elég adat a szűrési feltételeknek megfelelően.")
+
