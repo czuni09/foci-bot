@@ -11,6 +11,7 @@ from email.mime.multipart import MIMEMultipart
 from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
 import plotly.graph_objects as go
+import hashlib
 
 # ==================== KONFIGURÁCIÓ ====================
 ODDS_API_KEY = "cc1a32d7a1d30cb4898eb879ff6d636f"
@@ -30,8 +31,6 @@ NITTER_INSTANCES = [
 def init_database():
     conn = sqlite3.connect('football_intel.db', check_same_thread=False)
     c = conn.cursor()
-    
-    # Tábla létrehozása vagy módosítása
     c.execute('''CREATE TABLE IF NOT EXISTS predictions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         date TEXT,
@@ -49,13 +48,12 @@ def init_database():
         result TEXT DEFAULT 'PENDING',
         won INTEGER DEFAULT 0
     )''')
-    
     conn.commit()
     conn.close()
 
 init_database()
 
-# ==================== EMAIL KÜLDÉS ====================
+# ==================== EMAIL ====================
 def send_email(subject, body):
     try:
         msg = MIMEMultipart()
@@ -63,7 +61,6 @@ def send_email(subject, body):
         msg['From'] = SAJAT_EMAIL
         msg['To'] = SAJAT_EMAIL
         msg.attach(MIMEText(body, 'plain', 'utf-8'))
-        
         with smtplib.SMTP('smtp.gmail.com', 587) as server:
             server.starttls()
             server.login(SAJAT_EMAIL, GMAIL_APP_PASSWORD)
@@ -88,38 +85,58 @@ def get_weather(city="London"):
     except:
         return {'temp': 15, 'desc': 'ismeretlen', 'wind': 5, 'humidity': 60}
 
-def get_news_sentiment(team_name):
+def get_team_specific_news(team_name):
+    """Specifikus csapat hírek keresése több forrásból"""
     try:
-        url = f"https://newsapi.org/v2/everything?q={team_name} football&language=en&sortBy=publishedAt&pageSize=5&apiKey={NEWS_API_KEY}"
-        r = requests.get(url, timeout=5)
-        articles = r.json().get('articles', [])
+        # Specifikus keresési kifejezések
+        queries = [
+            f'"{team_name}" injury OR sérülés',
+            f'"{team_name}" lineup OR kezdőcsapat',
+            f'"{team_name}" form OR forma',
+            f'"{team_name}" news OR hírek'
+        ]
         
-        summary = []
+        all_articles = []
         sentiment = 0
-        for article in articles[:3]:
-            title = article.get('title', '')
-            desc = article.get('description', '')
-            full_text = (title + ' ' + desc).lower()
-            
-            summary.append(title)
-            
-            if any(word in full_text for word in ['win', 'victory', 'strong', 'top', 'best', 'form', 'excellent', 'brilliant']):
-                sentiment += 1
-            if any(word in full_text for word in ['loss', 'injury', 'crisis', 'doubt', 'weak', 'out', 'injured', 'suspended']):
-                sentiment -= 1
         
-        summary_text = ' | '.join(summary[:2]) if summary else "Nincs friss hír"
+        for query in queries:
+            url = f"https://newsapi.org/v2/everything?q={query}&language=en&sortBy=publishedAt&pageSize=3&apiKey={NEWS_API_KEY}"
+            r = requests.get(url, timeout=5)
+            articles = r.json().get('articles', [])
+            
+            for article in articles:
+                title = article.get('title', '')
+                desc = article.get('description', '')
+                full_text = (title + ' ' + desc).lower()
+                
+                # Csak releváns cikkek
+                if team_name.lower() in full_text:
+                    all_articles.append(title)
+                    
+                    # Sentiment
+                    if any(word in full_text for word in ['win', 'victory', 'strong', 'excellent', 'brilliant', 'top form']):
+                        sentiment += 2
+                    if any(word in full_text for word in ['injury', 'injured', 'out', 'suspended', 'crisis', 'loss', 'doubt']):
+                        sentiment -= 2
+            
+            time.sleep(0.3)  # Rate limit
+        
+        # Deduplikáció
+        unique_articles = list(set(all_articles))
+        summary_text = ' | '.join(unique_articles[:3]) if unique_articles else f"Nincs specifikus hír a(z) {team_name} csapatról"
+        
         return summary_text, sentiment
-    except:
-        return "Nincs friss hír", 0
+    except Exception as e:
+        print(f"News API hiba: {e}")
+        return f"Hír keresési hiba: {team_name}", 0
 
 def get_reddit_gossip():
     try:
         feed = feedparser.parse("https://www.reddit.com/r/soccer/.rss")
         hot_topics = []
-        for entry in feed.entries[:5]:
+        for entry in feed.entries[:10]:
             title = entry.title
-            if any(word in title.lower() for word in ['rumor', 'gossip', 'drama', 'controversy', 'scandal', 'incident']):
+            if any(word in title.lower() for word in ['rumor', 'gossip', 'drama', 'controversy', 'scandal', 'incident', 'injury', 'transfer']):
                 hot_topics.append(title)
         gossip_text = " | ".join(hot_topics[:3]) if hot_topics else "Nincs friss pletyká"
         return gossip_text
@@ -128,12 +145,12 @@ def get_reddit_gossip():
 
 def scrape_referee_data(referee_name="Michael Oliver"):
     referee_db = {
-        "Michael Oliver": {'yellow_avg': 3.2, 'red_avg': 0.1, 'penalties': 0.15, 'bias': 'semleges'},
-        "Anthony Taylor": {'yellow_avg': 4.5, 'red_avg': 0.05, 'penalties': 0.18, 'bias': 'semleges'},
-        "Szymon Marciniak": {'yellow_avg': 5.2, 'red_avg': 0.04, 'penalties': 0.12, 'bias': 'semleges'},
-        "Istvan Kovacs": {'yellow_avg': 4.0, 'red_avg': 0.03, 'penalties': 0.10, 'bias': 'semleges'}
+        "Michael Oliver": {'yellow_avg': 3.2, 'red_avg': 0.1, 'bias': 'semleges'},
+        "Anthony Taylor": {'yellow_avg': 4.5, 'red_avg': 0.05, 'bias': 'semleges'},
+        "Szymon Marciniak": {'yellow_avg': 5.2, 'red_avg': 0.04, 'bias': 'semleges'},
+        "Istvan Kovacs": {'yellow_avg': 4.0, 'red_avg': 0.03, 'bias': 'semleges'}
     }
-    return referee_db.get(referee_name, {'yellow_avg': 3.5, 'red_avg': 0.08, 'penalties': 0.14, 'bias': 'semleges', 'name': referee_name})
+    return referee_db.get(referee_name, {'yellow_avg': 3.5, 'red_avg': 0.08, 'bias': 'semleges', 'name': referee_name})
 
 # ==================== ELEMZŐ MOTOR ====================
 class FootballIntelligenceEngine:
@@ -146,7 +163,7 @@ class FootballIntelligenceEngine:
             res.raise_for_status()
             return [s['key'] for s in res.json() if s['group'] == 'Soccer' and 'winner' not in s['key']]
         except:
-            return ['soccer_epl', 'soccer_spain_la_liga', 'soccer_germany_bundesliga', 'soccer_italy_serie_a', 'soccer_france_ligue_one']
+            return ['soccer_epl', 'soccer_spain_la_liga', 'soccer_germany_bundesliga', 'soccer_italy_serie_a']
     
     def analyze_match(self, match_data):
         home = match_data['home_team']
@@ -176,8 +193,10 @@ class FootballIntelligenceEngine:
         city = home.split()[-1] if ' ' in home else 'London'
         weather = get_weather(city)
         
-        news_home, sent_home = get_news_sentiment(home)
-        news_away, sent_away = get_news_sentiment(away)
+        # Specifikus hírek keresése
+        news_home, sent_home = get_team_specific_news(home)
+        time.sleep(0.5)
+        news_away, sent_away = get_team_specific_news(away)
         
         gossip = get_reddit_gossip()
         referee = scrape_referee_data()
@@ -188,25 +207,21 @@ class FootballIntelligenceEngine:
             score += 15
         elif 1.35 <= fav_odds <= 1.70:
             score += 10
-        else:
-            score += 5
         
         if favorite == home:
-            score += sent_home * 5
+            score += sent_home * 3
         else:
-            score += sent_away * 5
+            score += sent_away * 3
         
         if weather['wind'] > 15:
             score -= 10
-        if 'rain' in weather['desc'].lower() or 'storm' in weather['desc'].lower():
+        if 'rain' in weather['desc'].lower():
             score -= 5
         if weather['temp'] > 30:
             score -= 5
         
         if referee['bias'] == 'semleges':
             score += 10
-        else:
-            score -= 5
         
         final_score = min(100, max(0, score))
         
@@ -265,10 +280,10 @@ def daily_morning_analysis():
     picks = engine.get_daily_picks()
     
     if not picks:
-        send_email("⚽ Napi Elemzés - Nincs tipp", "Ma nincs megfelelő mérkőzés.")
+        send_email("⚽ Napi Elemzés", "Ma nincs megfelelő mérkőzés.")
         return
     
-    email_body = "🛡️ STRATEGIC FOOTBALL INTELLIGENCE - NAPI ELEMZÉS\n"
+    email_body = "🛡️ STRATEGIC FOOTBALL INTELLIGENCE\n"
     email_body += f"📅 {datetime.now().strftime('%Y.%m.%d %H:%M')}\n"
     email_body += "=" * 70 + "\n\n"
     
@@ -277,19 +292,16 @@ def daily_morning_analysis():
         w = pick['weather']
         ref = pick['referee']
         
-        email_body += f"🎯 TIPP #{i}\n"
-        email_body += f"Mérkőzés: {pick['match']}\n"
-        email_body += f"Bajnokság: {pick['league'].replace('soccer_', '').replace('_', ' ').upper()}\n"
+        email_body += f"🎯 TIPP #{i}: {pick['match']}\n"
+        email_body += f"Liga: {pick['league'].replace('soccer_', '').upper()}\n"
         email_body += f"Kezdés: {kickoff_local.strftime('%Y.%m.%d %H:%M')}\n"
         email_body += f"Tipp: {pick['pick']} @ {pick['odds']:.2f}\n"
-        email_body += f"Magabiztosság: {pick['score']}/100\n\n"
+        email_body += f"Score: {pick['score']}/100\n\n"
         email_body += f"🌦️ Időjárás: {w['temp']:.1f}°C, {w['desc']}, szél {w['wind']:.1f} m/s\n"
-        email_body += f"📰 Hírek: {pick['news_home']} | {pick['news_away']}\n"
-        email_body += f"👨‍⚖️ Bíró: {ref.get('name', 'Ismeretlen')} ({ref['yellow_avg']} sárga/meccs)\n"
-        email_body += f"💬 Reddit: {pick['gossip'][:100]}\n\n"
-        email_body += f"💡 Indoklás: A {pick['pick']} csapat {pick['odds']:.2f} oddsa ideális. "
-        email_body += f"Időjárás {'kedvező' if w['wind'] < 10 else 'közepesen kedvező'}. "
-        email_body += f"Hírek {'pozitívak' if pick['sentiment'] > 0 else 'semlegesek' if pick['sentiment'] == 0 else 'vegyes képet mutatnak'}.\n"
+        email_body += f"📰 {pick['home']}: {pick['news_home'][:150]}\n"
+        email_body += f"📰 {pick['away']}: {pick['news_away'][:150]}\n"
+        email_body += f"👨‍⚖️ Bíró: {ref.get('name', 'Ismeretlen')} ({ref['yellow_avg']} sárga)\n"
+        email_body += f"💬 Reddit: {pick['gossip'][:100]}\n"
         email_body += "=" * 70 + "\n\n"
     
     send_email("⚽ Napi Tippek", email_body)
@@ -304,15 +316,12 @@ def pre_match_update():
     if not upcoming:
         return
     
-    email_body = "🔔 MECCS ELŐTTI UPDATE (30 perc)\n"
-    email_body += f"📅 {datetime.now().strftime('%Y.%m.%d %H:%M')}\n\n"
-    
+    email_body = "🔔 MECCS ELŐTTI UPDATE\n\n"
     for pick in upcoming:
         email_body += f"⚽ {pick['match']}\n"
-        email_body += f"Tipp: {pick['pick']} @ {pick['odds']:.2f}\n"
-        email_body += f"Score: {pick['score']}/100\n\n"
+        email_body += f"Tipp: {pick['pick']} @ {pick['odds']:.2f}\n\n"
     
-    send_email("⚽ Meccs Előtti Update", email_body)
+    send_email("⚽ Update", email_body)
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=daily_morning_analysis, trigger="cron", hour=10, minute=0)
@@ -320,23 +329,53 @@ scheduler.add_job(func=pre_match_update, trigger="interval", minutes=15)
 scheduler.start()
 atexit.register(lambda: scheduler.shutdown())
 
-# ==================== UI ====================
+# ==================== MODERN UI ====================
 st.set_page_config(page_title="⚽ Strategic Intelligence", layout="wide", page_icon="⚽")
 
 st.markdown("""
     <style>
-    .stApp { background-color: #0d1117; }
-    .metric-good { color: #3dff8b; font-weight: bold; }
-    .metric-neutral { color: #ffa500; font-weight: bold; }
-    .metric-bad { color: #ff4b4b; font-weight: bold; }
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
+    
+    * { font-family: 'Inter', sans-serif; }
+    .stApp { 
+        background: linear-gradient(135deg, #0a0e27 0%, #1a1f3a 100%);
+    }
+    .main-header {
+        background: linear-gradient(90deg, #00d4ff, #7b2cbf);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-weight: 700;
+        font-size: 2.5rem;
+        text-align: center;
+        margin-bottom: 1rem;
+    }
+    .metric-card {
+        background: rgba(255,255,255,0.05);
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 16px;
+        padding: 20px;
+        margin: 10px 0;
+        box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+    }
+    .good { color: #00ff88; }
+    .neutral { color: #ffa500; }
+    .bad { color: #ff4b6e; }
+    .neon-border {
+        border: 2px solid #00d4ff;
+        box-shadow: 0 0 20px rgba(0,212,255,0.5);
+        border-radius: 12px;
+        padding: 15px;
+    }
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🛡️ Strategic Football Intelligence V6.0")
-st.caption("Auto: 10:00 + Meccs-30min | czunidaniel9@gmail.com")
+st.markdown('<h1 class="main-header">⚽ Strategic Football Intelligence V7.0</h1>', unsafe_allow_html=True)
+st.caption("🤖 AI-Powered Analysis | Auto: 10:00 + Pre-Match | czunidaniel9@gmail.com")
 
+# Sidebar
 with st.sidebar:
-    st.header("📊 Statisztikák")
+    st.markdown("### 📊 Dashboard")
     conn = sqlite3.connect('football_intel.db', check_same_thread=False)
     c = conn.cursor()
     
@@ -344,116 +383,153 @@ with st.sidebar:
     won = c.execute("SELECT COUNT(*) FROM predictions WHERE won=1").fetchone()[0]
     pending = c.execute("SELECT COUNT(*) FROM predictions WHERE result='PENDING'").fetchone()[0]
     
-    st.metric("Összes tipp", total)
-    st.metric("Nyert", won, f"{(won/total*100) if total > 0 else 0:.1f}%")
-    st.metric("Függőben", pending)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("📈 Total", total)
+        st.metric("✅ Won", won)
+    with col2:
+        st.metric("📊 Rate", f"{(won/total*100) if total > 0 else 0:.0f}%")
+        st.metric("⏳ Pending", pending)
     
     conn.close()
+    
+    st.divider()
+    st.info("🔄 **Scheduler**\n- 10:00 Analysis\n- 30min Pre-Match")
 
-tab1, tab2 = st.tabs(["📅 Mai Tippek", "📜 Történet"])
+# Tabs
+tab1, tab2 = st.tabs(["🎯 Today's Picks", "📜 History"])
 
 with tab1:
-    col1, col2 = st.columns(2)
+    col1, col2 = st.columns([3, 1])
     
     with col1:
-        if st.button("🚀 ELEMZÉS", type="primary", use_container_width=True):
-            with st.spinner("🔍 Szkennelés..."):
-                engine = FootballIntelligenceEngine()
-                picks = engine.get_daily_picks()
-                
-                if not picks:
-                    st.warning("⚠️ Nincs megfelelő mérkőzés")
-                else:
-                    st.success(f"✅ {len(picks)} tipp!")
-                    
-                    for i, pick in enumerate(picks, 1):
-                        with st.expander(f"🎯 #{i} - {pick['match']} ({pick['odds']:.2f})", expanded=True):
-                            kickoff_local = pick['kickoff_dt'].astimezone()
-                            
-                            col_l, col_r = st.columns([2, 1])
-                            
-                            with col_l:
-                                st.markdown(f"### {pick['match']}")
-                                st.info(f"⏰ {kickoff_local.strftime('%Y.%m.%d %H:%M')} | 🏆 {pick['league'].replace('soccer_', '').upper()}")
-                                st.markdown(f"**🎲 Tipp:** `{pick['pick']}` @ **{pick['odds']:.2f}**")
-                                
-                                w = pick['weather']
-                                st.markdown("#### 🌦️ Időjárás:")
-                                st.markdown(f"- {w['temp']:.1f}°C, {w['desc']}, szél {w['wind']:.1f} m/s")
-                                
-                                st.markdown("#### 📰 Hírek:")
-                                st.markdown(f"- {pick['home']}: {pick['news_home']}")
-                                st.markdown(f"- {pick['away']}: {pick['news_away']}")
-                                
-                                ref = pick['referee']
-                                st.markdown(f"#### 👨‍⚖️ Bíró: {ref.get('name', 'Ismeretlen')} ({ref['yellow_avg']} sárga)")
-                                
-                                st.markdown(f"#### 💬 Reddit: {pick['gossip'][:150]}...")
-                            
-                            with col_r:
-                                st.metric("🎯 Score", f"{pick['score']}/100")
-                                st.metric("💰 Odds", f"{pick['odds']:.2f}")
-                                
-                                fig = go.Figure(go.Indicator(
-                                    mode="gauge+number",
-                                    value=pick['score'],
-                                    gauge={'axis': {'range': [0, 100]},
-                                           'bar': {'color': "#3dff8b" if pick['score'] > 75 else "#ffa500"}}
-                                ))
-                                fig.update_layout(height=200, margin=dict(l=20,r=20,t=20,b=20), paper_bgcolor="#0d1117")
-                                st.plotly_chart(fig, use_container_width=True)
-                                
-                                if st.button(f"💾 Mentés", key=f"save_{i}"):
-                                    reasoning = f"{pick['pick']} @ {pick['odds']:.2f}. Score: {pick['score']}/100."
-                                    
-                                    conn = sqlite3.connect('football_intel.db', check_same_thread=False)
-                                    c = conn.cursor()
-                                    c.execute('''INSERT INTO predictions 
-                                        (date, match, league, pick, odds, kickoff, reasoning, weather, referee, news_summary, sentiment_score, gossip)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                                        (datetime.now().strftime('%Y-%m-%d'), pick['match'], pick['league'], pick['pick'], pick['odds'],
-                                         pick['kickoff_dt'].isoformat(), reasoning, json.dumps(pick['weather']), json.dumps(pick['referee']),
-                                         pick['news_home'], pick['sentiment'], pick['gossip']))
-                                    conn.commit()
-                                    conn.close()
-                                    st.success("✅ Mentve!")
-    
+        analyze_btn = st.button("🚀 RUN ANALYSIS", type="primary", use_container_width=True)
     with col2:
-        if st.button("📧 EMAIL", use_container_width=True):
-            with st.spinner("📧 Küldés..."):
-                daily_morning_analysis()
-                st.success("✅ Elküldve!")
+        email_btn = st.button("📧 Send Email", use_container_width=True)
+    
+    if analyze_btn:
+        with st.spinner("🔍 Scanning markets & gathering intel..."):
+            engine = FootballIntelligenceEngine()
+            picks = engine.get_daily_picks()
+            
+            if not picks:
+                st.warning("⚠️ No suitable matches in the next 24h")
+            else:
+                st.success(f"✅ {len(picks)} high-quality picks found!")
+                
+                for i, pick in enumerate(picks, 1):
+                    # Unique key generálása
+                    match_id = hashlib.md5(f"{pick['match']}_{pick['kickoff']}_{i}".encode()).hexdigest()[:8]
+                    
+                    kickoff_local = pick['kickoff_dt'].astimezone()
+                    
+                    with st.container():
+                        st.markdown(f'<div class="neon-border">', unsafe_allow_html=True)
+                        
+                        col_info, col_viz = st.columns([2, 1])
+                        
+                        with col_info:
+                            st.markdown(f"### 🎯 Pick #{i}: {pick['match']}")
+                            st.markdown(f"**🏆 League:** {pick['league'].replace('soccer_', '').replace('_', ' ').upper()}")
+                            st.markdown(f"**⏰ Kickoff:** {kickoff_local.strftime('%Y.%m.%d %H:%M')}")
+                            st.markdown(f"**💰 Recommendation:** `{pick['pick']}` @ **{pick['odds']:.2f}**")
+                            
+                            # Weather
+                            w = pick['weather']
+                            weather_class = "good" if w['wind'] < 10 else "neutral" if w['wind'] < 15 else "bad"
+                            st.markdown(f"🌦️ **Weather:** <span class='{weather_class}'>{w['temp']:.1f}°C, {w['desc']}, wind {w['wind']:.1f}m/s</span>", unsafe_allow_html=True)
+                            
+                            # News
+                            st.markdown(f"📰 **{pick['home']}:** {pick['news_home'][:120]}...")
+                            st.markdown(f"📰 **{pick['away']}:** {pick['news_away'][:120]}...")
+                            
+                            # Referee
+                            ref = pick['referee']
+                            st.markdown(f"👨‍⚖️ **Referee:** {ref.get('name', 'Unknown')} (Avg {ref['yellow_avg']} yellows)")
+                            
+                            # Reddit
+                            st.markdown(f"💬 **Reddit:** {pick['gossip'][:100]}...")
+                        
+                        with col_viz:
+                            st.metric("🎯 Confidence", f"{pick['score']}/100")
+                            st.metric("💰 Odds", f"{pick['odds']:.2f}")
+                            
+                            # Plotly gauge with unique key
+                            fig = go.Figure(go.Indicator(
+                                mode="gauge+number",
+                                value=pick['score'],
+                                gauge={
+                                    'axis': {'range': [0, 100]},
+                                    'bar': {'color': "#00ff88" if pick['score'] > 75 else "#ffa500" if pick['score'] > 60 else "#ff4b6e"},
+                                    'steps': [
+                                        {'range': [0, 60], 'color': "#1a1f3a"},
+                                        {'range': [60, 75], 'color': "#2a3050"},
+                                        {'range': [75, 100], 'color': "#3a4060"}
+                                    ]
+                                }
+                            ))
+                            fig.update_layout(
+                                height=180,
+                                margin=dict(l=10, r=10, t=10, b=10),
+                                paper_bgcolor="rgba(0,0,0,0)",
+                                font={'color': "white", 'size': 14}
+                            )
+                            st.plotly_chart(fig, use_container_width=True, key=f"gauge_{match_id}")
+                            
+                            if st.button("💾 Save", key=f"save_{match_id}"):
+                                reasoning = f"{pick['pick']} @ {pick['odds']:.2f}. Score: {pick['score']}/100."
+                                conn = sqlite3.connect('football_intel.db', check_same_thread=False)
+                                c = conn.cursor()
+                                c.execute('''INSERT INTO predictions 
+                                    (date, match, league, pick, odds, kickoff, reasoning, weather, referee, news_summary, sentiment_score, gossip)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                                    (datetime.now().strftime('%Y-%m-%d'), pick['match'], pick['league'], pick['pick'], pick['odds'],
+                                     pick['kickoff_dt'].isoformat(), reasoning, json.dumps(pick['weather']), json.dumps(pick['referee']),
+                                     pick['news_home'] + ' | ' + pick['news_away'], pick['sentiment'], pick['gossip']))
+                                conn.commit()
+                                conn.close()
+                                st.success("✅ Saved!")
+                        
+                        st.markdown('</div>', unsafe_allow_html=True)
+                        st.markdown("<br>", unsafe_allow_html=True)
+    
+    if email_btn:
+        with st.spinner("📧 Sending..."):
+            daily_morning_analysis()
+            st.success("✅ Email sent!")
 
 with tab2:
-    st.header("📜 Történet")
+    st.markdown("### 📜 Prediction History")
     
     conn = sqlite3.connect('football_intel.db', check_same_thread=False)
-    history = conn.execute("SELECT * FROM predictions ORDER BY id DESC LIMIT 50").fetchall()
+    history = conn.execute("SELECT * FROM predictions ORDER BY id DESC LIMIT 30").fetchall()
     conn.close()
     
     if not history:
-        st.info("Nincs még tipp.")
+        st.info("No predictions yet. Run analysis first!")
     else:
         for row in history:
             id_, date, match, league, pick, odds, kickoff, reasoning, weather, referee, news, sent, gossip, result, won = row
             
             status = "✅" if won == 1 else "❌" if result != 'PENDING' else "⏳"
+            hist_id = hashlib.md5(f"hist_{id_}".encode()).hexdigest()[:8]
             
             with st.expander(f"{status} {date} - {match} ({pick} @ {odds:.2f})"):
                 st.markdown(f"**Kickoff:** {kickoff}")
-                st.markdown(f"**Státusz:** {result}")
+                st.markdown(f"**League:** {league}")
+                st.markdown(f"**Status:** {result}")
                 
                 if result == 'PENDING':
                     c1, c2 = st.columns(2)
                     with c1:
-                        if st.button(f"✅ Nyert", key=f"w_{id_}"):
+                        if st.button("✅ Won", key=f"win_{hist_id}"):
                             conn = sqlite3.connect('football_intel.db', check_same_thread=False)
                             conn.execute("UPDATE predictions SET result='WON', won=1 WHERE id=?", (id_,))
                             conn.commit()
                             conn.close()
                             st.rerun()
                     with c2:
-                        if st.button(f"❌ Vesztett", key=f"l_{id_}"):
+                        if st.button("❌ Lost", key=f"loss_{hist_id}"):
                             conn = sqlite3.connect('football_intel.db', check_same_thread=False)
                             conn.execute("UPDATE predictions SET result='LOST', won=0 WHERE id=?", (id_,))
                             conn.commit()
@@ -461,4 +537,5 @@ with tab2:
                             st.rerun()
 
 st.divider()
-st.caption("⚡ V6.0 | czunidaniel9@gmail.com")
+st.caption("⚡ Strategic Intelligence V7.0 | Powered by AI | czunidaniel9@gmail.com")
+
