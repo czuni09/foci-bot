@@ -30,6 +30,8 @@ NITTER_INSTANCES = [
 def init_database():
     conn = sqlite3.connect('football_intel.db', check_same_thread=False)
     c = conn.cursor()
+    
+    # Tábla létrehozása vagy módosítása
     c.execute('''CREATE TABLE IF NOT EXISTS predictions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         date TEXT,
@@ -47,6 +49,7 @@ def init_database():
         result TEXT DEFAULT 'PENDING',
         won INTEGER DEFAULT 0
     )''')
+    
     conn.commit()
     conn.close()
 
@@ -54,7 +57,6 @@ init_database()
 
 # ==================== EMAIL KÜLDÉS ====================
 def send_email(subject, body):
-    """Email küldés a czunidaniel9@gmail.com címre"""
     try:
         msg = MIMEMultipart()
         msg['Subject'] = subject
@@ -73,7 +75,6 @@ def send_email(subject, body):
 
 # ==================== ADATGYŰJTÉS ====================
 def get_weather(city="London"):
-    """Időjárás lekérés OpenWeather API-val"""
     try:
         url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_KEY}&units=metric&lang=hu"
         r = requests.get(url, timeout=5)
@@ -88,7 +89,6 @@ def get_weather(city="London"):
         return {'temp': 15, 'desc': 'ismeretlen', 'wind': 5, 'humidity': 60}
 
 def get_news_sentiment(team_name):
-    """Hírek + sentiment elemzés News API-val"""
     try:
         url = f"https://newsapi.org/v2/everything?q={team_name} football&language=en&sortBy=publishedAt&pageSize=5&apiKey={NEWS_API_KEY}"
         r = requests.get(url, timeout=5)
@@ -114,7 +114,6 @@ def get_news_sentiment(team_name):
         return "Nincs friss hír", 0
 
 def get_reddit_gossip():
-    """Reddit pletykák r/soccer-ből"""
     try:
         feed = feedparser.parse("https://www.reddit.com/r/soccer/.rss")
         hot_topics = []
@@ -128,7 +127,6 @@ def get_reddit_gossip():
         return "Reddit elérhetetlen"
 
 def scrape_referee_data(referee_name="Michael Oliver"):
-    """Bíró adatok"""
     referee_db = {
         "Michael Oliver": {'yellow_avg': 3.2, 'red_avg': 0.1, 'penalties': 0.15, 'bias': 'semleges'},
         "Anthony Taylor": {'yellow_avg': 4.5, 'red_avg': 0.05, 'penalties': 0.18, 'bias': 'semleges'},
@@ -151,7 +149,6 @@ class FootballIntelligenceEngine:
             return ['soccer_epl', 'soccer_spain_la_liga', 'soccer_germany_bundesliga', 'soccer_italy_serie_a', 'soccer_france_ligue_one']
     
     def analyze_match(self, match_data):
-        """Teljes mérkőzés elemzés"""
         home = match_data['home_team']
         away = match_data['away_team']
         
@@ -183,7 +180,6 @@ class FootballIntelligenceEngine:
         news_away, sent_away = get_news_sentiment(away)
         
         gossip = get_reddit_gossip()
-        
         referee = scrape_referee_data()
         
         score = 50
@@ -231,7 +227,6 @@ class FootballIntelligenceEngine:
         }
     
     def get_daily_picks(self):
-        """Napi tippek generálása"""
         leagues = self.discover_leagues()
         candidates = []
         
@@ -264,18 +259,17 @@ class FootballIntelligenceEngine:
         candidates.sort(key=lambda x: x['score'], reverse=True)
         return candidates[:3]
 
-# ==================== SCHEDULER FUNKCIÓK ====================
+# ==================== SCHEDULER ====================
 def daily_morning_analysis():
-    """Reggel 10:00-kor automatikus elemzés és email"""
     engine = FootballIntelligenceEngine()
     picks = engine.get_daily_picks()
     
     if not picks:
-        send_email("⚽ Napi Elemzés - Nincs tipp", "Ma nincs megfelelő mérkőzés a kritériumoknak megfelelően.")
+        send_email("⚽ Napi Elemzés - Nincs tipp", "Ma nincs megfelelő mérkőzés.")
         return
     
     email_body = "🛡️ STRATEGIC FOOTBALL INTELLIGENCE - NAPI ELEMZÉS\n"
-    email_body += f"📅 Dátum: {datetime.now().strftime('%Y.%m.%d %H:%M')}\n"
+    email_body += f"📅 {datetime.now().strftime('%Y.%m.%d %H:%M')}\n"
     email_body += "=" * 70 + "\n\n"
     
     for i, pick in enumerate(picks, 1):
@@ -289,56 +283,18 @@ def daily_morning_analysis():
         email_body += f"Kezdés: {kickoff_local.strftime('%Y.%m.%d %H:%M')}\n"
         email_body += f"Tipp: {pick['pick']} @ {pick['odds']:.2f}\n"
         email_body += f"Magabiztosság: {pick['score']}/100\n\n"
-        
-        email_body += f"🌦️ IDŐJÁRÁS:\n"
-        email_body += f"  - Hőmérséklet: {w['temp']:.1f}°C\n"
-        email_body += f"  - Időjárás: {w['desc']}\n"
-        email_body += f"  - Szél: {w['wind']:.1f} m/s\n"
-        email_body += f"  - Páratartalom: {w['humidity']}%\n\n"
-        
-        email_body += f"📰 HÍREK:\n"
-        email_body += f"  - {pick['home']}: {pick['news_home']}\n"
-        email_body += f"  - {pick['away']}: {pick['news_away']}\n"
-        sentiment_label = "Pozitív" if pick['sentiment'] > 0 else "Semleges" if pick['sentiment'] == 0 else "Negatív"
-        email_body += f"  - Hangulat: {sentiment_label}\n\n"
-        
-        email_body += f"👨‍⚖️ BÍRÓ:\n"
-        email_body += f"  - Név: {ref.get('name', 'Ismeretlen')}\n"
-        email_body += f"  - Sárga lap átlag: {ref['yellow_avg']}/meccs\n"
-        email_body += f"  - Piros lap átlag: {ref['red_avg']}/meccs\n"
-        email_body += f"  - Beállítottság: {ref['bias']}\n\n"
-        
-        email_body += f"💬 REDDIT PLETYKÁK:\n"
-        email_body += f"  {pick['gossip']}\n\n"
-        
-        email_body += f"💡 MIÉRT EZT AJÁNLOM:\n"
-        email_body += f"  A {pick['pick']} csapat oddsa ({pick['odds']:.2f}) az ideális sávban van (1.45-1.60 sweet spot).\n"
-        
-        if w['wind'] < 10:
-            email_body += f"  Az időjárási körülmények kedvezőek (alacsony szél, {w['temp']:.1f}°C).\n"
-        else:
-            email_body += f"  Az időjárás közepesen kedvező (szél: {w['wind']:.1f} m/s).\n"
-        
-        if pick['sentiment'] > 0:
-            email_body += f"  A hírek pozitív képet mutatnak a csapatról.\n"
-        elif pick['sentiment'] < 0:
-            email_body += f"  A hírek vegyes képet mutatnak, ami óvatosságra int.\n"
-        else:
-            email_body += f"  A hírek semleges képet mutatnak.\n"
-        
-        email_body += f"  A bíró {ref['bias']} beállítottságú, ami kiegyensúlyozott játékvezetést valószínűsít.\n"
-        email_body += f"  Összesített értékelés: {pick['score']}/100 pont.\n"
+        email_body += f"🌦️ Időjárás: {w['temp']:.1f}°C, {w['desc']}, szél {w['wind']:.1f} m/s\n"
+        email_body += f"📰 Hírek: {pick['news_home']} | {pick['news_away']}\n"
+        email_body += f"👨‍⚖️ Bíró: {ref.get('name', 'Ismeretlen')} ({ref['yellow_avg']} sárga/meccs)\n"
+        email_body += f"💬 Reddit: {pick['gossip'][:100]}\n\n"
+        email_body += f"💡 Indoklás: A {pick['pick']} csapat {pick['odds']:.2f} oddsa ideális. "
+        email_body += f"Időjárás {'kedvező' if w['wind'] < 10 else 'közepesen kedvező'}. "
+        email_body += f"Hírek {'pozitívak' if pick['sentiment'] > 0 else 'semlegesek' if pick['sentiment'] == 0 else 'vegyes képet mutatnak'}.\n"
         email_body += "=" * 70 + "\n\n"
     
-    email_body += "\n⚠️ FONTOS:\n"
-    email_body += "- Ez elemzés, nem fogadási tanács!\n"
-    email_body += "- Csak saját felelősségre fogadj!\n"
-    email_body += "- A múltbeli eredmények nem garantálják a jövőbeli sikert!\n"
-    
-    send_email("⚽ Napi Tippek - Reggeli Elemzés", email_body)
+    send_email("⚽ Napi Tippek", email_body)
 
 def pre_match_update():
-    """Mérkőzés előtt 30 perccel friss update"""
     engine = FootballIntelligenceEngine()
     picks = engine.get_daily_picks()
     
@@ -348,45 +304,36 @@ def pre_match_update():
     if not upcoming:
         return
     
-    email_body = "🔔 FRISS MÉRKŐZÉS ELŐTTI UPDATE (30 PERC)\n"
-    email_body += f"📅 {datetime.now().strftime('%Y.%m.%d %H:%M')}\n"
-    email_body += "=" * 70 + "\n\n"
+    email_body = "🔔 MECCS ELŐTTI UPDATE (30 perc)\n"
+    email_body += f"📅 {datetime.now().strftime('%Y.%m.%d %H:%M')}\n\n"
     
     for pick in upcoming:
         email_body += f"⚽ {pick['match']}\n"
-        email_body += f"Kezdés: {pick['kickoff_dt'].astimezone().strftime('%H:%M')}\n"
-        email_body += f"Tipp megerősítve: {pick['pick']} @ {pick['odds']:.2f}\n"
-        email_body += f"Friss hírek: {pick['news_home']} | {pick['news_away']}\n"
-        email_body += f"Magabiztosság: {pick['score']}/100\n"
-        email_body += "-" * 70 + "\n\n"
+        email_body += f"Tipp: {pick['pick']} @ {pick['odds']:.2f}\n"
+        email_body += f"Score: {pick['score']}/100\n\n"
     
-    send_email("⚽ Meccs Előtti Update (30 perc)", email_body)
+    send_email("⚽ Meccs Előtti Update", email_body)
 
-# Scheduler beállítás
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=daily_morning_analysis, trigger="cron", hour=10, minute=0)
 scheduler.add_job(func=pre_match_update, trigger="interval", minutes=15)
 scheduler.start()
 atexit.register(lambda: scheduler.shutdown())
 
-# ==================== STREAMLIT UI ====================
-st.set_page_config(page_title="⚽ Strategic Football Intelligence", layout="wide", page_icon="⚽")
+# ==================== UI ====================
+st.set_page_config(page_title="⚽ Strategic Intelligence", layout="wide", page_icon="⚽")
 
 st.markdown("""
     <style>
     .stApp { background-color: #0d1117; }
-    .match-card {
-        background: #161b22; border: 1px solid #30363d;
-        padding: 20px; border-radius: 10px; margin-bottom: 15px;
-    }
     .metric-good { color: #3dff8b; font-weight: bold; }
     .metric-neutral { color: #ffa500; font-weight: bold; }
     .metric-bad { color: #ff4b4b; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🛡️ Strategic Football Intelligence System V6.0 PRO")
-st.caption("Auto Email: Reggel 10:00 + Meccs előtt 30 perc | czunidaniel9@gmail.com")
+st.title("🛡️ Strategic Football Intelligence V6.0")
+st.caption("Auto: 10:00 + Meccs-30min | czunidaniel9@gmail.com")
 
 with st.sidebar:
     st.header("📊 Statisztikák")
@@ -402,9 +349,6 @@ with st.sidebar:
     st.metric("Függőben", pending)
     
     conn.close()
-    
-    st.divider()
-    st.info("🔄 Auto scheduler:\n- 10:00 reggeli elemzés\n- 15 percenként meccs check (30 perc előtt email)")
 
 tab1, tab2 = st.tabs(["📅 Mai Tippek", "📜 Történet"])
 
@@ -412,74 +356,55 @@ with tab1:
     col1, col2 = st.columns(2)
     
     with col1:
-        if st.button("🚀 AZONNALI ELEMZÉS", type="primary", use_container_width=True):
-            with st.spinner("🔍 Piacok szkennelése..."):
+        if st.button("🚀 ELEMZÉS", type="primary", use_container_width=True):
+            with st.spinner("🔍 Szkennelés..."):
                 engine = FootballIntelligenceEngine()
                 picks = engine.get_daily_picks()
                 
                 if not picks:
-                    st.warning("⚠️ Nincs megfelelő mérkőzés a következő 24 órában (1.35-1.70 odds tartomány)")
+                    st.warning("⚠️ Nincs megfelelő mérkőzés")
                 else:
-                    st.success(f"✅ {len(picks)} minőségi tipp találva!")
+                    st.success(f"✅ {len(picks)} tipp!")
                     
                     for i, pick in enumerate(picks, 1):
-                        with st.expander(f"🎯 TIPP #{i} - {pick['match']} (Odds: {pick['odds']:.2f}, Score: {pick['score']}/100)", expanded=True):
+                        with st.expander(f"🎯 #{i} - {pick['match']} ({pick['odds']:.2f})", expanded=True):
                             kickoff_local = pick['kickoff_dt'].astimezone()
                             
-                            col_left, col_right = st.columns([2, 1])
+                            col_l, col_r = st.columns([2, 1])
                             
-                            with col_left:
+                            with col_l:
                                 st.markdown(f"### {pick['match']}")
-                                st.info(f"⏰ **Kezdés:** {kickoff_local.strftime('%Y.%m.%d %H:%M')} | 🏆 **Bajnokság:** {pick['league'].replace('soccer_', '').replace('_', ' ').upper()}")
+                                st.info(f"⏰ {kickoff_local.strftime('%Y.%m.%d %H:%M')} | 🏆 {pick['league'].replace('soccer_', '').upper()}")
                                 st.markdown(f"**🎲 Tipp:** `{pick['pick']}` @ **{pick['odds']:.2f}**")
                                 
-                                st.markdown("#### 🌦️ Időjárás:")
                                 w = pick['weather']
-                                weather_color = "metric-good" if w['wind'] < 10 else "metric-neutral" if w['wind'] < 15 else "metric-bad"
-                                st.markdown(f"- Hőmérséklet: <span class='{weather_color}'>{w['temp']:.1f}°C</span>", unsafe_allow_html=True)
-                                st.markdown(f"- Időjárás: {w['desc']}")
-                                st.markdown(f"- Szél: <span class='{weather_color}'>{w['wind']:.1f} m/s</span>", unsafe_allow_html=True)
-                                st.markdown(f"- Páratartalom: {w['humidity']}%")
+                                st.markdown("#### 🌦️ Időjárás:")
+                                st.markdown(f"- {w['temp']:.1f}°C, {w['desc']}, szél {w['wind']:.1f} m/s")
                                 
                                 st.markdown("#### 📰 Hírek:")
-                                sentiment_color = "metric-good" if pick['sentiment'] > 0 else "metric-neutral" if pick['sentiment'] == 0 else "metric-bad"
-                                st.markdown(f"- **{pick['home']}:** {pick['news_home']}")
-                                st.markdown(f"- **{pick['away']}:** {pick['news_away']}")
-                                st.markdown(f"- **Hangulat:** <span class='{sentiment_color}'>{'Pozitív' if pick['sentiment'] > 0 else 'Semleges' if pick['sentiment'] == 0 else 'Negatív'}</span>", unsafe_allow_html=True)
+                                st.markdown(f"- {pick['home']}: {pick['news_home']}")
+                                st.markdown(f"- {pick['away']}: {pick['news_away']}")
                                 
-                                st.markdown("#### 👨‍⚖️ Bíró:")
                                 ref = pick['referee']
-                                st.markdown(f"- Név: {ref.get('name', 'Ismeretlen')}")
-                                st.markdown(f"- Sárga lap átlag: {ref['yellow_avg']}/meccs")
-                                st.markdown(f"- Piros lap átlag: {ref['red_avg']}/meccs")
-                                st.markdown(f"- Beállítottság: {ref['bias']}")
+                                st.markdown(f"#### 👨‍⚖️ Bíró: {ref.get('name', 'Ismeretlen')} ({ref['yellow_avg']} sárga)")
                                 
-                                st.markdown("#### 💬 Reddit pletykák:")
-                                st.markdown(f"{pick['gossip'][:200]}...")
+                                st.markdown(f"#### 💬 Reddit: {pick['gossip'][:150]}...")
                             
-                            with col_right:
-                                st.metric("🎯 Magabiztosság", f"{pick['score']}/100")
+                            with col_r:
+                                st.metric("🎯 Score", f"{pick['score']}/100")
                                 st.metric("💰 Odds", f"{pick['odds']:.2f}")
                                 
                                 fig = go.Figure(go.Indicator(
-                                    mode = "gauge+number",
-                                    value = pick['score'],
-                                    domain = {'x': [0, 1], 'y': [0, 1]},
-                                    gauge = {
-                                        'axis': {'range': [None, 100]},
-                                        'bar': {'color': "#3dff8b" if pick['score'] > 75 else "#ffa500" if pick['score'] > 60 else "#ff4b4b"},
-                                        'steps': [
-                                            {'range': [0, 60], 'color': "#1a1a1a"},
-                                            {'range': [60, 75], 'color': "#2a2a2a"},
-                                            {'range': [75, 100], 'color': "#3a3a3a"}
-                                        ]
-                                    }
+                                    mode="gauge+number",
+                                    value=pick['score'],
+                                    gauge={'axis': {'range': [0, 100]},
+                                           'bar': {'color': "#3dff8b" if pick['score'] > 75 else "#ffa500"}}
                                 ))
-                                fig.update_layout(height=200, margin=dict(l=20,r=20,t=20,b=20), paper_bgcolor="#0d1117", font={'color': "white"})
+                                fig.update_layout(height=200, margin=dict(l=20,r=20,t=20,b=20), paper_bgcolor="#0d1117")
                                 st.plotly_chart(fig, use_container_width=True)
                                 
                                 if st.button(f"💾 Mentés", key=f"save_{i}"):
-                                    reasoning = f"A {pick['pick']} csapat {pick['odds']:.2f} oddsa optimális (1.45-1.60 sweet spot). Időjárás {'kedvező' if w['wind'] < 10 else 'közepesen kedvező'} ({w['temp']:.1f}°C, szél {w['wind']:.1f} m/s). Hírek {'pozitívak' if pick['sentiment'] > 0 else 'semlegesek' if pick['sentiment'] == 0 else 'vegyes képet mutatnak'}. Bíró {ref['bias']} beállítottságú. Összesített score: {pick['score']}/100."
+                                    reasoning = f"{pick['pick']} @ {pick['odds']:.2f}. Score: {pick['score']}/100."
                                     
                                     conn = sqlite3.connect('football_intel.db', check_same_thread=False)
                                     c = conn.cursor()
@@ -488,26 +413,26 @@ with tab1:
                                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                                         (datetime.now().strftime('%Y-%m-%d'), pick['match'], pick['league'], pick['pick'], pick['odds'],
                                          pick['kickoff_dt'].isoformat(), reasoning, json.dumps(pick['weather']), json.dumps(pick['referee']),
-                                         pick['news_home'] + ' | ' + pick['news_away'], pick['sentiment'], pick['gossip']))
+                                         pick['news_home'], pick['sentiment'], pick['gossip']))
                                     conn.commit()
                                     conn.close()
                                     st.success("✅ Mentve!")
     
     with col2:
-        if st.button("📧 KÜLDÉS EMAILBEN", use_container_width=True):
-            with st.spinner("📧 Email küldése..."):
+        if st.button("📧 EMAIL", use_container_width=True):
+            with st.spinner("📧 Küldés..."):
                 daily_morning_analysis()
-                st.success("✅ Email elküldve a czunidaniel9@gmail.com címre!")
+                st.success("✅ Elküldve!")
 
 with tab2:
-    st.header("📜 Tippek Története")
+    st.header("📜 Történet")
     
     conn = sqlite3.connect('football_intel.db', check_same_thread=False)
     history = conn.execute("SELECT * FROM predictions ORDER BY id DESC LIMIT 50").fetchall()
     conn.close()
     
     if not history:
-        st.info("Még nincs mentett tipp. Futtasd az elemzést!")
+        st.info("Nincs még tipp.")
     else:
         for row in history:
             id_, date, match, league, pick, odds, kickoff, reasoning, weather, referee, news, sent, gossip, result, won = row
@@ -516,21 +441,19 @@ with tab2:
             
             with st.expander(f"{status} {date} - {match} ({pick} @ {odds:.2f})"):
                 st.markdown(f"**Kickoff:** {kickoff}")
-                st.markdown(f"**Liga:** {league}")
-                st.markdown(f"**Indoklás:** {reasoning}")
                 st.markdown(f"**Státusz:** {result}")
                 
                 if result == 'PENDING':
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if st.button(f"Nyert ✅", key=f"win_{id_}"):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button(f"✅ Nyert", key=f"w_{id_}"):
                             conn = sqlite3.connect('football_intel.db', check_same_thread=False)
                             conn.execute("UPDATE predictions SET result='WON', won=1 WHERE id=?", (id_,))
                             conn.commit()
                             conn.close()
                             st.rerun()
-                    with col2:
-                        if st.button(f"Vesztett ❌", key=f"loss_{id_}"):
+                    with c2:
+                        if st.button(f"❌ Vesztett", key=f"l_{id_}"):
                             conn = sqlite3.connect('football_intel.db', check_same_thread=False)
                             conn.execute("UPDATE predictions SET result='LOST', won=0 WHERE id=?", (id_,))
                             conn.commit()
@@ -538,4 +461,4 @@ with tab2:
                             st.rerun()
 
 st.divider()
-st.caption("⚡ Strategic Intelligence V6.0 PRO | Auto: 10:00 + Meccs-30min | Email: czunidaniel9@gmail.com")
+st.caption("⚡ V6.0 | czunidaniel9@gmail.com")
