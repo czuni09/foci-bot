@@ -1,107 +1,573 @@
 import streamlit as st
-import pandas as pd
 import requests
+import sqlite3
+from datetime import datetime, timedelta, timezone
+import feedparser
+from bs4 import BeautifulSoup
+import time
+import json
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from apscheduler.schedulers.background import BackgroundScheduler
+import atexit
 import plotly.graph_objects as go
-import random
-from datetime import datetime
 
-# ==============================================================================
-# 🏆 TITAN V33.0 - BIG MATCH ENGINE (NO MORE AVOIDING RANGADÓK)
-# ==============================================================================
+# ==================== KONFIGURÁCIÓ ====================
+ODDS_API_KEY = "cc1a32d7a1d30cb4898eb879ff6d636f"
+WEATHER_KEY = "c31a011d35fed1b4d7b9f222c99d6dd2"
+NEWS_API_KEY = "7d577a4d9f2b4ba38541cc3f7e5ad6f5"
+FOOTBALL_DATA_KEY = "4fb029dfe0f5464492779774807045d3"
+GMAIL_APP_PASSWORD = "whppzywzoduqjrgk"
+SAJAT_EMAIL = "czunidaniel9@gmail.com"
 
-st.set_page_config(page_title="TITAN V33 - DERBY MODE", layout="wide")
+NITTER_INSTANCES = [
+    "https://nitter.poast.org",
+    "https://nitter.privacydev.net",
+    "https://nitter.unixfox.eu"
+]
+
+ELITE_TEAMS = [
+    "Manchester United", "Newcastle", "Arsenal", "Liverpool", 
+    "Manchester City", "Tottenham", "Chelsea", "Real Madrid", 
+    "Barcelona", "Bayern München", "PSG", "Juventus", "Inter Milan"
+]
+
+# ==================== ADATBÁZIS ====================
+def init_database():
+    conn = sqlite3.connect('football_intel.db', check_same_thread=False)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS predictions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT,
+        match TEXT,
+        league TEXT,
+        pick TEXT,
+        odds REAL,
+        kickoff TEXT,
+        reasoning TEXT,
+        weather TEXT,
+        referee TEXT,
+        news_summary TEXT,
+        sentiment_score REAL,
+        gossip TEXT,
+        is_derby INTEGER DEFAULT 0,
+        result TEXT DEFAULT 'PENDING',
+        won INTEGER DEFAULT 0
+    )''')
+    conn.commit()
+    conn.close()
+
+init_database()
+
+# ==================== EMAIL KÜLDÉS ====================
+def send_email(subject, body):
+    """Email küldés a czunidaniel9@gmail.com címre"""
+    try:
+        msg = MIMEMultipart()
+        msg['Subject'] = subject
+        msg['From'] = SAJAT_EMAIL
+        msg['To'] = SAJAT_EMAIL
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+        
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.starttls()
+            server.login(SAJAT_EMAIL, GMAIL_APP_PASSWORD)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"Email hiba: {e}")
+        return False
+
+# ==================== ADATGYŰJTÉS ====================
+def get_nitter_feed(username):
+    """Twitter RSS Nitter-en keresztül"""
+    for instance in NITTER_INSTANCES:
+        try:
+            url = f"{instance}/{username}/rss"
+            feed = feedparser.parse(url)
+            if feed.entries:
+                return feed.entries[:5]
+        except:
+            continue
+    return []
+
+def get_weather(city="London"):
+    """Időjárás lekérés OpenWeather API-val"""
+    try:
+        url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_KEY}&units=metric&lang=hu"
+        r = requests.get(url, timeout=5)
+        data = r.json()
+        return {
+            'temp': data['main']['temp'],
+            'desc': data['weather'][0]['description'],
+            'wind': data['wind']['speed'],
+            'humidity': data['main']['humidity']
+        }
+    except:
+        return {'temp': 15, 'desc': 'ismeretlen', 'wind': 5, 'humidity': 60}
+
+def get_news_sentiment(team_name):
+    """Hírek + sentiment elemzés News API-val"""
+    try:
+        url = f"https://newsapi.org/v2/everything?q={team_name} football&language=en&sortBy=publishedAt&pageSize=5&apiKey={NEWS_API_KEY}"
+        r = requests.get(url, timeout=5)
+        articles = r.json().get('articles', [])
+        
+        summary = []
+        sentiment = 0
+        for article in articles[:3]:
+            title = article.get('title', '')
+            desc = article.get('description', '')
+            full_text = (title + ' ' + desc).lower()
+            
+            summary.append(title)
+            
+            # Pozitív kulcsszavak
+            if any(word in full_text for word in ['win', 'victory', 'strong', 'top', 'best', 'form', 'excellent', 'brilliant']):
+                sentiment += 1
+            # Negatív kulcsszavak
+            if any(word in full_text for word in ['loss', 'injury', 'crisis', 'doubt', 'weak', 'out', 'injured', 'suspended']):
+                sentiment -= 1
+        
+        summary_text = ' | '.join(summary[:2]) if summary else "Nincs friss hír"
+        return summary_text, sentiment
+    except:
+        return "Nincs friss hír", 0
+
+def get_reddit_gossip():
+    """Reddit pletykák r/soccer-ből"""
+    try:
+        feed = feedparser.parse("https://www.reddit.com/r/soccer/.rss")
+        hot_topics = []
+        for entry in feed.entries[:5]:
+            title = entry.title
+            # Szűrés releváns pletykákra
+            if any(word in title.lower() for word in ['rumor', 'gossip', 'drama', 'controversy', 'scandal', 'incident']):
+                hot_topics.append(title)
+        gossip_text = " | ".join(hot_topics[:3]) if hot_topics else "Nincs friss pletyká"
+        return gossip_text
+    except:
+        return "Reddit elérhetetlen"
+
+def scrape_referee_data(referee_name="Michael Oliver"):
+    """Bíró adatok (placeholder - valós scraping később)"""
+    referee_db = {
+        "Michael Oliver": {'yellow_avg': 3.2, 'red_avg': 0.1, 'penalties': 0.15, 'bias': 'semleges'},
+        "Anthony Taylor": {'yellow_avg': 4.5, 'red_avg': 0.05, 'penalties': 0.18, 'bias': 'semleges'},
+        "Szymon Marciniak": {'yellow_avg': 5.2, 'red_avg': 0.04, 'penalties': 0.12, 'bias': 'semleges'},
+        "Istvan Kovacs": {'yellow_avg': 4.0, 'red_avg': 0.03, 'penalties': 0.10, 'bias': 'semleges'}
+    }
+    return referee_db.get(referee_name, {'yellow_avg': 3.5, 'red_avg': 0.08, 'penalties': 0.14, 'bias': 'semleges', 'name': referee_name})
+
+def is_big_derby(home, away):
+    """Rangadó detektálás"""
+    return home in ELITE_TEAMS and away in ELITE_TEAMS
+
+# ==================== ELEMZŐ MOTOR ====================
+class FootballIntelligenceEngine:
+    def __init__(self):
+        self.base_url = "https://api.the-odds-api.com/v4/sports"
+        
+    def discover_leagues(self):
+        try:
+            res = requests.get(f"{self.base_url}?apiKey={ODDS_API_KEY}", timeout=10)
+            res.raise_for_status()
+            return [s['key'] for s in res.json() if s['group'] == 'Soccer' and 'winner' not in s['key']]
+        except:
+            return ['soccer_epl', 'soccer_spain_la_liga', 'soccer_germany_bundesliga', 'soccer_italy_serie_a', 'soccer_uefa_champs_league']
+    
+    def analyze_match(self, match_data):
+        """Teljes mérkőzés elemzés rangadó detektálással"""
+        home = match_data['home_team']
+        away = match_data['away_team']
+        
+        # Rangadó check
+        is_derby = is_big_derby(home, away)
+        
+        bookmakers = match_data.get('bookmakers', [])
+        best_odds = {}
+        for bookie in bookmakers:
+            if bookie['key'] in ['pinnacle', 'bet365', 'unibet', 'williamhill', 'marathonbet']:
+                for market in bookie.get('markets', []):
+                    if market['key'] == 'h2h':
+                        for outcome in market['outcomes']:
+                            name = outcome['name']
+                            price = float(outcome['price'])
+                            if name not in best_odds or price > best_odds[name]:
+                                best_odds[name] = price
+        
+        if not best_odds:
+            return None
+        
+        favorite = min(best_odds, key=best_odds.get)
+        fav_odds = best_odds[favorite]
+        
+        # Odds range: rangadóknál tágabb, normál meccsnél szigorúbb
+        if is_derby:
+            if not (1.30 <= fav_odds <= 2.00):
+                return None
+        else:
+            if not (1.35 <= fav_odds <= 1.70):
+                return None
+        
+        # Város kinyerése
+        city = home.split()[-1] if ' ' in home else 'London'
+        weather = get_weather(city)
+        
+        # Hírek mindkét csapatról
+        news_home, sent_home = get_news_sentiment(home)
+        news_away, sent_away = get_news_sentiment(away)
+        
+        # Reddit pletykák
+        gossip = get_reddit_gossip()
+        
+        # Bíró
+        referee = scrape_referee_data()
+        
+        # SCORING ALGORITMUS
+        score = 50  # Alap
+        
+        # Odds érték
+        if 1.45 <= fav_odds <= 1.60:
+            score += 15
+        elif 1.35 <= fav_odds <= 1.70:
+            score += 10
+        else:
+            score += 5
+        
+        # Sentiment
+        if favorite == home:
+            score += sent_home * 5
+        else:
+            score += sent_away * 5
+        
+        # Időjárás
+        if weather['wind'] > 15:
+            score -= 10
+        if 'rain' in weather['desc'].lower() or 'storm' in weather['desc'].lower():
+            score -= 5
+        if weather['temp'] > 30:
+            score -= 5
+        
+        # Bíró
+        if referee['bias'] == 'semleges':
+            score += 10
+        else:
+            score -= 5
+        
+        # Rangadó bónusz
+        if is_derby:
+            score += 10
+        
+        # Végső score
+        final_score = min(100, max(0, score))
+        
+        return {
+            'match': f"{home} vs {away}",
+            'home': home,
+            'away': away,
+            'pick': favorite,
+            'odds': fav_odds,
+            'score': final_score,
+            'weather': weather,
+            'news_home': news_home,
+            'news_away': news_away,
+            'sentiment': sent_home if favorite == home else sent_away,
+            'gossip': gossip,
+            'referee': referee,
+            'kickoff': match_data['commence_time'],
+            'is_derby': is_derby
+        }
+    
+    def get_daily_picks(self):
+        """Napi tippek generálása"""
+        leagues = self.discover_leagues()
+        candidates = []
+        
+        now = datetime.now(timezone.utc)
+        limit_24h = now + timedelta(hours=24)
+        
+        for league in leagues:
+            url = f"{self.base_url}/{league}/odds"
+            params = {'apiKey': ODDS_API_KEY, 'regions': 'eu', 'markets': 'h2h', 'oddsFormat': 'decimal'}
+            
+            try:
+                response = requests.get(url, params=params, timeout=10)
+                if response.status_code == 422:
+                    continue
+                response.raise_for_status()
+                
+                for match in response.json():
+                    kickoff = datetime.fromisoformat(match['commence_time'].replace('Z', '+00:00'))
+                    if now <= kickoff <= limit_24h:
+                        analyzed = self.analyze_match(match)
+                        if analyzed:
+                            analyzed['league'] = league
+                            analyzed['kickoff_dt'] = kickoff
+                            candidates.append(analyzed)
+            except:
+                continue
+            
+            time.sleep(0.5)  # Rate limiting
+        
+        # Rendezés: rangadók előre, utána score szerint
+        candidates.sort(key=lambda x: (not x['is_derby'], -x['score']))
+        return candidates[:3]
+
+# ==================== SCHEDULER FUNKCIÓK ====================
+def daily_morning_analysis():
+    """Reggel 10:00-kor automatikus elemzés és email"""
+    engine = FootballIntelligenceEngine()
+    picks = engine.get_daily_picks()
+    
+    if not picks:
+        send_email("⚽ Napi Elemzés - Nincs tipp", "Ma nincs megfelelő mérkőzés a kritériumoknak megfelelően.")
+        return
+    
+    email_body = "🛡️ STRATEGIC FOOTBALL INTELLIGENCE - NAPI ELEMZÉS\n"
+    email_body += f"📅 Dátum: {datetime.now().strftime('%Y.%m.%d %H:%M')}\n"
+    email_body += "=" * 70 + "\n\n"
+    
+    for i, pick in enumerate(picks, 1):
+        kickoff_local = pick['kickoff_dt'].astimezone()
+        w = pick['weather']
+        ref = pick['referee']
+        
+        derby_marker = "🔥 RANGADÓ! " if pick['is_derby'] else ""
+        
+        email_body += f"{derby_marker}🎯 TIPP #{i}\n"
+        email_body += f"Mérkőzés: {pick['match']}\n"
+        email_body += f"Bajnokság: {pick['league'].replace('soccer_', '').replace('_', ' ').upper()}\n"
+        email_body += f"Kezdés: {kickoff_local.strftime('%Y.%m.%d %H:%M')}\n"
+        email_body += f"Tipp: {pick['pick']} @ {pick['odds']:.2f}\n"
+        email_body += f"Magabiztosság: {pick['score']}/100\n\n"
+        
+        email_body += f"🌦️ IDŐJÁRÁS:\n"
+        email_body += f"  - Hőmérséklet: {w['temp']:.1f}°C\n"
+        email_body += f"  - Időjárás: {w['desc']}\n"
+        email_body += f"  - Szél: {w['wind']:.1f} m/s\n"
+        email_body += f"  - Páratartalom: {w['humidity']}%\n\n"
+        
+        email_body += f"📰 HÍREK:\n"
+        email_body += f"  - {pick['home']}: {pick['news_home']}\n"
+        email_body += f"  - {pick['away']}: {pick['news_away']}\n"
+        sentiment_label = "Pozitív" if pick['sentiment'] > 0 else "Semleges" if pick['sentiment'] == 0 else "Negatív"
+        email_body += f"  - Hangulat: {sentiment_label}\n\n"
+        
+        email_body += f"👨‍⚖️ BÍRÓ:\n"
+        email_body += f"  - Név: {ref.get('name', 'Ismeretlen')}\n"
+        email_body += f"  - Sárga lap átlag: {ref['yellow_avg']}/meccs\n"
+        email_body += f"  - Piros lap átlag: {ref['red_avg']}/meccs\n"
+        email_body += f"  - Beállítottság: {ref['bias']}\n\n"
+        
+        email_body += f"💬 REDDIT PLETYKÁK:\n"
+        email_body += f"  {pick['gossip']}\n\n"
+        
+        email_body += f"💡 MIÉRT EZT AJÁNLOM:\n"
+        
+        if pick['is_derby']:
+            email_body += f"  Ez egy RANGADÓ ({pick['home']} vs {pick['away']}), ami mindig extra intenzitást jelent.\n"
+        
+        email_body += f"  A {pick['pick']} csapat oddsa ({pick['odds']:.2f}) az ideális sávban van.\n"
+        
+        if w['wind'] < 10:
+            email_body += f"  Az időjárási körülmények kedvezőek (alacsony szél, {w['temp']:.1f}°C).\n"
+        else:
+            email_body += f"  Az időjárás közepesen kedvező (szél: {w['wind']:.1f} m/s).\n"
+        
+        if pick['sentiment'] > 0:
+            email_body += f"  A hírek pozitív képet mutatnak a csapatról.\n"
+        elif pick['sentiment'] < 0:
+            email_body += f"  A hírek vegyes képet mutatnak, ami óvatosságra int.\n"
+        
+        email_body += f"  A bíró {ref['bias']} beállítottságú, ami kiegyensúlyozott játékvezetést valószínűsít.\n"
+        email_body += f"  Összesített értékelés: {pick['score']}/100 pont.\n"
+        email_body += "=" * 70 + "\n\n"
+    
+    email_body += "\n⚠️ FONTOS:\n"
+    email_body += "- Ez elemzés, nem fogadási tanács!\n"
+    email_body += "- Csak saját felelősségre fogadj!\n"
+    email_body += "- A múltbeli eredmények nem garantálják a jövőbeli sikert!\n"
+    
+    send_email("⚽ Napi Tippek - Reggeli Elemzés", email_body)
+
+def pre_match_update():
+    """Mérkőzés előtt 1 órával friss update"""
+    engine = FootballIntelligenceEngine()
+    picks = engine.get_daily_picks()
+    
+    now = datetime.now(timezone.utc)
+    upcoming = [p for p in picks if timedelta(minutes=50) <= (p['kickoff_dt'] - now) <= timedelta(minutes=70)]
+    
+    if not upcoming:
+        return
+    
+    email_body = "🔔 FRISS MÉRKŐZÉS ELŐTTI UPDATE\n"
+    email_body += f"📅 {datetime.now().strftime('%Y.%m.%d %H:%M')}\n"
+    email_body += "=" * 70 + "\n\n"
+    
+    for pick in upcoming:
+        derby_marker = "🔥 RANGADÓ " if pick['is_derby'] else ""
+        email_body += f"{derby_marker}⚽ {pick['match']}\n"
+        email_body += f"Kezdés: {pick['kickoff_dt'].astimezone().strftime('%H:%M')}\n"
+        email_body += f"Tipp megerősítve: {pick['pick']} @ {pick['odds']:.2f}\n"
+        email_body += f"Friss hírek: {pick['news_home']} | {pick['news_away']}\n"
+        email_body += f"Magabiztosság: {pick['score']}/100\n"
+        email_body += "-" * 70 + "\n\n"
+    
+    send_email("⚽ Meccs Előtti Update", email_body)
+
+# Scheduler beállítás
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=daily_morning_analysis, trigger="cron", hour=10, minute=0)
+scheduler.add_job(func=pre_match_update, trigger="interval", minutes=30)
+scheduler.start()
+atexit.register(lambda: scheduler.shutdown())
+
+# ==================== STREAMLIT UI ====================
+st.set_page_config(page_title="⚽ Strategic Football Intelligence", layout="wide", page_icon="⚽")
 
 st.markdown("""
     <style>
     .stApp { background-color: #0d1117; }
-    .derby-header {
+    .derby-badge {
         background: linear-gradient(90deg, #ff4b4b, #000, #ff4b4b);
-        color: white; padding: 15px; text-align: center;
-        border-radius: 10px; font-weight: bold; border: 1px solid gold;
+        color: white; padding: 10px; text-align: center;
+        border-radius: 8px; font-weight: bold; border: 2px solid gold;
+        margin-bottom: 15px;
     }
-    .market-box {
+    .match-card {
         background: #161b22; border: 1px solid #30363d;
-        padding: 15px; border-radius: 8px; margin-top: 10px;
+        padding: 20px; border-radius: 10px; margin-bottom: 15px;
     }
-    .hit-badge { background: #3dff8b; color: black; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+    .metric-good { color: #3dff8b; font-weight: bold; }
+    .metric-neutral { color: #ffa500; font-weight: bold; }
+    .metric-bad { color: #ff4b4b; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- KONFIGURÁCIÓ ---
-try:
-    ODDS_KEY = st.secrets["ODDS_API_KEY"]
-except:
-    st.error("API KULCS HIÁNYZIK!")
-    st.stop()
+st.title("🛡️ Strategic Football Intelligence System V6.0 PRO")
+st.caption("🔥 RANGADÓ MÓD AKTÍV | Auto Email: 10:00 + Meccs-1h | czunidaniel9@gmail.com")
 
-# --- 1. RANGADÓ SPECIFIKUS ELEMZŐ (10 MONDAT) ---
-def get_derby_analysis(h, a, is_big_match=True):
-    type_label = "RANGADÓ" if is_big_match else "MÉRKŐZÉS"
-    return f"""
-    Ez a {type_label} a beküldött 32 fogadási piac mindegyikén extrém intenzitást mutat. 
-    Mivel a(z) {h} és a(z) {a} összecsapása magas presztízzsel bír, a sima 1X2 piac helyett a fegyelmi mutatókra fókuszálunk. 
-    A történelmi adatok és a játékvezetői statisztikák alapján az 'Összes lap 4.5 felett' opció bír a legnagyobb értékkel. 
-    A taktikai elemzés szerint mindkét csapat agresszív letámadást alkalmaz, ami rengeteg taktikai szabálytalanságot szül a középpályán. 
-    A szögletek terén a széleken zajló küzdelem miatt a 10.5 feletti tartomány elérése valószínűsíthető. 
-    A góloknál a 'BTTS - Igen' (Mindkét csapat szerez gólt) piacot erősíti a támadósorok egyéni képessége és a védelmek feszültség alatti sebezhetősége. 
-    A játékos piacokon a(z) {h} főkisérlete legalább 3 kapura lövést fog produkálni a meccs intenzitása miatt. 
-    A hendikep vonalakon a +0.5-ös vendég opció (X2) jelenthet biztonsági értéket, ha az oddsok túlzottan eltolódtak. 
-    A mérkőzés utolsó 15 percében (Gólidő piac) a statisztikák alapján megnő a gólveszély a fáradó védelmek és a kockáztatás miatt. 
-    Összegezve: a rangadó komplexitása miatt a kombinált 'Gól + Lap' piacok kínálják a legprofibb megközelítést.
-    """
-
-# --- 2. RANGADÓ SZŰRŐ (MU, Newcastle, Arsenal, Liverpool, stb.) ---
-def is_big_match(h, a):
-    ELITE = ["Manchester United", "Newcastle", "Arsenal", "Liverpool", "Manchester City", "Tottenham", "Chelsea", "Real Madrid", "Barcelona", "Bayern München"]
-    return h in ELITE and a in ELITE
-
-# --- UI DASHBOARD ---
-st.markdown("<h1 style='text-align:center;'>🦾 TITAN V33.0 - BIG MATCH ENGINE</h1>", unsafe_allow_html=True)
-
-# --- STATISZTIKA (VISSZAMÉRÉS) ---
-col_s1, col_s2, col_s3 = st.columns(3)
-col_s1.metric("Összesített Profit", "+42.8 unit", "✅")
-col_s2.metric("Rangadó találati arány", "71%", "🔥")
-col_s3.metric("Lezárt piaci elemzés", "214 db", "📊")
-
-# --- ADATGYŰJTÉS (PL. MU vs NEWCASTLE SZIMULÁCIÓ) ---
-matches = [
-    {"h": "Manchester United", "a": "Newcastle", "h_o": 2.10, "d_o": 3.40, "v_o": 3.20},
-    {"h": "Liverpool", "a": "Arsenal", "h_o": 2.25, "d_o": 3.50, "v_o": 2.90}
-]
-
-for m in matches:
-    is_derby = is_big_match(m['h'], m['a'])
-    header_style = "derby-header" if is_derby else ""
+with st.sidebar:
+    st.header("📊 Statisztikák")
+    conn = sqlite3.connect('football_intel.db', check_same_thread=False)
+    c = conn.cursor()
     
-    st.markdown(f"<div class='{header_style}'>🔥 RANGADÓ DETEKTÁLVA: {m['h']} vs {m['a']}</div>", unsafe_allow_html=True)
+    total = c.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+    won = c.execute("SELECT COUNT(*) FROM predictions WHERE won=1").fetchone()[0]
+    pending = c.execute("SELECT COUNT(*) FROM predictions WHERE result='PENDING'").fetchone()[0]
+    derby_total = c.execute("SELECT COUNT(*) FROM predictions WHERE is_derby=1").fetchone()[0]
+    derby_won = c.execute("SELECT COUNT(*) FROM predictions WHERE is_derby=1 AND won=1").fetchone()[0]
     
-    col1, col2 = st.columns([1, 1.5])
-    
-    with col1:
-        # HDA Valószínűségi grafikon
-        fig = go.Figure(go.Bar(x=[m['h'], 'X', m['a']], y=[45, 25, 30], marker_color=['#ff4b4b', '#555', '#2ecc71']))
-        fig.update_layout(template="plotly_dark", height=250, margin=dict(l=0,r=0,t=0,b=0))
-        st.plotly_chart(fig, use_container_width=True)
-        
-
-    with col2:
-        st.markdown(f"### 📋 Stratégiai Riport")
-        st.write(get_derby_analysis(m['h'], m['a'], is_derby))
-
-    # PIACI MÁTRIX (A 32 piac legfontosabbjai)
-    st.markdown("#### 🎯 Kiemelt Piaci Valószínűségek (Rangadó Mód)")
-    m1, m2, m3, m4 = st.columns(4)
-    
-    with m1:
-        st.markdown("<div class='market-box'><b>Lapok (Fegyelmi)</b><br>4.5 Felett<br><span class='hit-badge'>82% valószínűség</span></div>", unsafe_allow_html=True)
-    with m2:
-        st.markdown("<div class='market-box'><b>Szögletek</b><br>10.5 Felett<br><span class='hit-badge'>74% valószínűség</span></div>", unsafe_allow_html=True)
-    with m3:
-        st.markdown("<div class='market-box'><b>BTTS (Gólok)</b><br>Igen<br><span class='hit-badge'>68% valószínűség</span></div>", unsafe_allow_html=True)
-    with m4:
-        st.markdown("<div class='market-box'><b>Játékos SOT</b><br>H: 3.5+ V: 2.5+<br><span class='hit-badge'>Profi érték</span></div>", unsafe_allow_html=True)
+    st.metric("Összes tipp", total)
+    st.metric("Nyert", won, f"{(won/total*100) if total > 0 else 0:.1f}%")
+    st.metric("Függőben", pending)
     
     st.divider()
+    st.subheader("🔥 Rangadó Stats")
+    st.metric("Rangadó tippek", derby_total)
+    st.metric("Rangadó nyerések", derby_won, f"{(derby_won/derby_total*100) if derby_total > 0 else 0:.1f}%")
+    
+    conn.close()
+    
+    st.divider()
+    st.info("🔄 Auto scheduler:\n- 10:00 reggeli elemzés\n- 30 percenként meccs check")
 
-st.caption("TITAN V33.0 - A rendszer mostantól prioritásként kezeli a rangadókat és az extrém piaci kilengéseket.")
+tab1, tab2 = st.tabs(["📅 Mai Tippek", "📜 Történet"])
+
+with tab1:
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("🚀 AZONNALI ELEMZÉS", type="primary", use_container_width=True):
+            with st.spinner("🔍 Piacok szkennelése..."):
+                engine = FootballIntelligenceEngine()
+                picks = engine.get_daily_picks()
+                
+                if not picks:
+                    st.warning("⚠️ Nincs megfelelő mérkőzés a következő 24 órában")
+                else:
+                    st.success(f"✅ {len(picks)} minőségi tipp találva!")
+                    
+                    for i, pick in enumerate(picks, 1):
+                        if pick['is_derby']:
+                            st.markdown(f"<div class='derby-badge'>🔥 RANGADÓ DETEKTÁLVA: {pick['match']}</div>", unsafe_allow_html=True)
+                        
+                        with st.expander(f"🎯 TIPP #{i} - {pick['match']} (Odds: {pick['odds']:.2f}, Score: {pick['score']}/100)", expanded=True):
+                            kickoff_local = pick['kickoff_dt'].astimezone()
+                            
+                            col_left, col_right = st.columns([2, 1])
+                            
+                            with col_left:
+                                st.markdown(f"### {pick['match']}")
+                                st.info(f"⏰ **Kezdés:** {kickoff_local.strftime('%Y.%m.%d %H:%M')} | 🏆 **Bajnokság:** {pick['league'].replace('soccer_', '').replace('_', ' ').upper()}")
+                                st.markdown(f"**🎲 Tipp:** `{pick['pick']}` @ **{pick['odds']:.2f}**")
+                                
+                                # Időjárás
+                                st.markdown("#### 🌦️ Időjárás:")
+                                w = pick['weather']
+                                weather_color = "metric-good" if w['wind'] < 10 else "metric-neutral" if w['wind'] < 15 else "metric-bad"
+                                st.markdown(f"- Hőmérséklet: <span class='{weather_color}'>{w['temp']:.1f}°C</span>", unsafe_allow_html=True)
+                                st.markdown(f"- Időjárás: {w['desc']}")
+                                st.markdown(f"- Szél: <span class='{weather_color}'>{w['wind']:.1f} m/s</span>", unsafe_allow_html=True)
+                                
+                                # Hírek
+                                st.markdown("#### 📰 Hírek:")
+                                sentiment_color = "metric-good" if pick['sentiment'] > 0 else "metric-neutral" if pick['sentiment'] == 0 else "metric-bad"
+                                st.markdown(f"- **{pick['home']}:** {pick['news_home']}")
+                                st.markdown(f"- **{pick['away']}:** {pick['news_away']}")
+                                st.markdown(f"- **Hangulat:** <span class='{sentiment_color}'>{'Pozitív' if pick['sentiment'] > 0 else 'Semleges' if pick['sentiment'] == 0 else 'Negatív'}</span>", unsafe_allow_html=True)
+                                
+                                # Bíró
+                                st.markdown("#### 👨‍⚖️ Bíró:")
+                                ref = pick['referee']
+                                st.markdown(f"- Név: {ref.get('name', 'Ismeretlen')}")
+                                st.markdown(f"- Sárga lap átlag: {ref['yellow_avg']}/meccs")
+                                st.markdown(f"- Beállítottság: {ref['bias']}")
+                                
+                                # Reddit
+                                st.markdown("#### 💬 Reddit pletykák:")
+                                st.markdown(f"{pick['gossip'][:150]}...")
+                            
+                            with col_right:
+                                st.metric("🎯 Magabiztosság", f"{pick['score']}/100")
+                                st.metric("💰 Odds", f"{pick['odds']:.2f}")
+                                
+                                if pick['is_derby']:
+                                    st.success("🔥 RANGADÓ!")
+                                
+                                # Grafikon
+                                fig = go.Figure(go.Indicator(
+                                    mode = "gauge+number",
+                                    value = pick['score'],
+                                    domain = {'x': [0, 1], 'y': [0, 1]},
+                                    gauge = {
+                                        'axis': {'range': [None, 100]},
+                                        'bar': {'color': "#3dff8b" if pick['score'] > 75 else "#ffa500" if pick['score'] > 60 else "#ff4b4b"},
+                                        'steps': [
+                                            {'range': [0, 60], 'color': "#1a1a1a"},
+                                            {'range': [60, 75], 'color': "#2a2a2a"},
+                                            {'range': [75, 100], 'color': "#3a3a3a"}
+                                        ]
+                                    }
+                                ))
+                                fig.update_layout(height=200, margin=dict(l=20,r=20,t=20,b=20), paper_bgcolor="#0d1117", font={'color': "white"})
+                                st.plotly_chart(fig, use_container_width=True)
+                                
+                                # Mentés
+                                if st.button(f"💾 Mentés", key=f"save_{i}"):
+                                    reasoning = f"{'RANGADÓ! ' if pick['is_derby'] else ''}A {pick['pick']} csapat {pick['odds']:.2f} oddsa optimális. Időjárás {'kedvező' if w['wind'] < 10 else 'közepesen kedvező'}. Hírek {'pozitívak' if pick['sentiment'] > 0 else 'semlegesek' if pick['sentiment'] == 0 else 'vegyes képet mutatnak'}. Bíró {ref['bias']}. Score: {pick['score']}/100."
+                                    
+                                    conn = sqlite3.connect('football_intel.db', check_same_thread=False)
+                                    c = conn.cursor()
+                                    c.execute('''INSERT INTO predictions 
+                                        (date, match, league, pick, odds, kickoff, reasoning, weather, referee, news_summary, sentiment_score, gossip, is_derby)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                                        (datetime.now().strftime('%Y-%m-%d'), pick['match'], pick['league'], pick['pick'], pick['odds'],
+                                         pick['kickoff_dt'].isoformat(), reasoning, json.dumps(pick['weather']), json.dumps(pick['referee']),
+                                         pick['news_home'] + ' | ' + pick['news_away'], pick['sentiment'], pick['gossip'], 1 if pick['is_derby'] else 0))
+                                    conn.commit()
+                                    conn.close()
+                                    st
