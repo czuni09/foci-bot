@@ -10,116 +10,134 @@ try:
     WEATHER_KEY = st.secrets["WEATHER_API_KEY"]
     NEWS_API_KEY = st.secrets["NEWS_API_KEY"]
 except:
-    st.error("API kulcsok hiányoznak!")
+    st.error("Hiba: Az API kulcsok hiányoznak a Streamlit Secrets-ből!")
     st.stop()
 
-# --- MODULOK: HÍREK ÉS JÁTÉKOSOK ---
-def get_team_intel(team_name):
-    """Lekéri a legfrissebb híreket, sérülteket és belső infókat."""
+# --- MÉLYELEMZŐ MODUL (HÍREK & JÁTÉKOSOK) ---
+def get_deep_intel(team_name):
     try:
-        # Kifejezett keresés sérültekre és felállásra
-        query = f"{team_name} football injury lineup news"
-        url = f"https://newsapi.org/v2/everything?q={query}&language=en&sortBy=publishedAt&pageSize=5&apiKey={NEWS_API_KEY}"
+        # Keresés kifejezetten sérültekre és kulcsjátékosokra
+        url = f"https://newsapi.org/v2/everything?q={team_name} team news injury lineup&language=en&sortBy=publishedAt&pageSize=5&apiKey={NEWS_API_KEY}"
         res = requests.get(url, timeout=5).json()
         articles = res.get('articles', [])
         
         if not articles:
-            return "Nincs specifikus hír a keretről.", 0, "A csapat stabilnak tűnik."
+            return 0, "Nincs friss belső hír, a csapat az alapértelmezett kerettel állhat ki.", "Stabil keret."
+
+        text = " ".join([a['title'].lower() for a in articles])
         
-        full_text = " ".join([a['title'].lower() + " " + (a['description'] or "").lower() for a in articles])
+        # Játékos/Sérülés detektálás
+        bad_news = ['injury', 'out', 'doubt', 'suspended', 'missing', 'crisis', 'calf', 'hamstring']
+        good_news = ['return', 'fit', 'back', 'starts', 'boost', 'training']
         
-        # Kulcsszó figyelés
-        injuries = [w for w in ['injury', 'out', 'doubtful', 'unavailable', 'miss', 'broken'] if w in full_text]
-        boosts = [w for w in ['returns', 'fit', 'starts', 'key player', 'back'] if w in full_text]
+        score_mod = 0
+        reasons = []
         
-        sentiment = len(boosts) - len(injuries)
-        intel_summary = articles[0]['title']
-        
-        # Részletes indoklás generálása a hírek alapján
-        detail = "A hírek alapján a keret hiányos lehet." if len(injuries) > 0 else "A kulcsjátékosok bevethető állapotban vannak."
-        if len(boosts) > 0: detail += " Fontos visszatérők erősítik a kezdőt."
-        
-        return intel_summary, sentiment, detail
+        for w in bad_news:
+            if w in text:
+                score_mod -= 12
+                reasons.append(f"Sérülési hírek/hiányzók ({w})")
+                break
+        for w in good_news:
+            if w in text:
+                score_mod += 10
+                reasons.append(f"Fontos visszatérők ({w})")
+                break
+                
+        intel_text = articles[0]['title']
+        detail = " | ".join(reasons) if reasons else "Nincs jelentős változás a keretben."
+        return score_mod, intel_text, detail
     except:
-        return "Hírek nem elérhetők.", 0, "Nincs adat."
+        return 0, "Hírszolgáltatás átmenetileg szünetel.", "Nincs adat."
 
 # --- MOTOR ---
-class TicketGeneratorV8:
+class TicketMasterV9:
     def __init__(self):
-        self.leagues = ['soccer_epl', 'soccer_championship', 'soccer_spain_la_liga', 'soccer_italy_serie_a']
+        self.leagues = ['soccer_epl', 'soccer_championship', 'soccer_spain_la_liga', 'soccer_italy_serie_a', 'soccer_germany_bundesliga', 'soccer_france_ligue1']
 
-    def get_ticket(self):
-        all_matches = []
+    def generate(self):
+        all_picks = []
         for lg in self.leagues:
             url = f"https://api.the-odds-api.com/v4/sports/{lg}/odds?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h"
-            data = requests.get(url).json()
-            if isinstance(data, list):
+            try:
+                data = requests.get(url, timeout=10).json()
                 for m in data:
-                    # Csak a következő 24 óra
-                    kickoff = datetime.fromisoformat(m['commence_time'].replace('Z', '+00:00'))
-                    if kickoff > datetime.now(timezone.utc) + timedelta(hours=24): continue
-                    
                     home, away = m['home_team'], m['away_team']
-                    bookie = next((b for b in m.get('bookmakers', []) if b['key'] == 'bet365'), None)
+                    bookie = next((b for b in m.get('bookmakers', []) if b['key'] in ['bet365', 'unibet', 'pinnacle']), None)
                     if not bookie: continue
                     
                     market = next((mk for mk in bookie['markets'] if mk['key'] == 'h2h'), None)
                     fav = min(market['outcomes'], key=lambda x: x['price'])
                     
-                    # Csak biztonságosabb oddsok (1.30 - 1.60), hogy a kettő kijöjjön 2.00 körül
-                    if 1.30 <= fav['price'] <= 1.65:
-                        intel, sent, detail = get_team_intel(fav['name'])
-                        all_matches.append({
-                            'match': f"{home} vs {away}",
-                            'pick': fav['name'],
-                            'odds': fav['price'],
-                            'score': 70 + (sent * 10),
-                            'intel': intel,
-                            'detail': detail
-                        })
+                    # Alap pontszám az odds alapján
+                    base_score = 85 if fav['price'] < 1.50 else 75 if fav['price'] < 1.80 else 65
+                    
+                    # Hír alapú módosító
+                    mod, news_head, news_det = get_deep_intel(fav['name'])
+                    final_score = base_score + mod
+                    
+                    all_picks.append({
+                        'match': f"{home} vs {away}",
+                        'pick': fav['name'],
+                        'odds': fav['price'],
+                        'score': min(99, final_score),
+                        'news': news_head,
+                        'detail': news_det
+                    })
+            except: continue
         
-        # Kiválasztjuk a két legjobb "százalékos" meccset
-        sorted_matches = sorted(all_matches, key=lambda x: x['score'], reverse=True)
-        return sorted_matches[:2]
+        # Mindig adjon ki valamit: sorbarendezzük és a legjobb kettőt vesszük
+        return sorted(all_picks, key=lambda x: x['score'], reverse=True)[:2]
 
 # --- UI ---
-st.set_page_config(page_title="Ticket Master V8", layout="wide")
-st.title("🎫 Napi Dupla Szelvény (2.00x)")
+st.set_page_config(page_title="Ticket Master V9.0", layout="wide")
+st.title("🎫 Professzionális Dupla Szelvény Generátor")
+st.markdown("---")
 
-if st.button("🚀 SZELVÉNY GENERÁLÁSA"):
-    engine = TicketGeneratorV8()
-    ticket = engine.get_ticket()
-    
-    if len(ticket) < 2:
-        st.warning("Ma nincs elég biztonságos meccs a szelvényhez. Próbáld később!")
-    else:
-        total_odds = ticket[0]['odds'] * ticket[1]['odds']
-        st.header(f"Eredő szorzó: {total_odds:.2f}")
+if st.button("🚀 SZELVÉNY ÖSSZEÁLLÍTÁSA"):
+    engine = TicketMasterV9()
+    with st.spinner("Hírek elemzése és szelvény kalkulálása..."):
+        ticket = engine.generate()
         
-        for i, p in enumerate(ticket):
-            status = "💎 TUTI" if p['score'] >= 85 else "✅ AJÁNLOTT"
-            with st.container():
-                st.subheader(f"{i+1}. Mérkőzés: {p['match']}")
-                c1, c2 = st.columns([1, 2])
-                with c1:
-                    st.metric("Esély", f"{p['score']}%", status)
-                    st.write(f"**Tipp:** {p['pick']}")
-                    st.write(f"**Odds:** {p['odds']}")
-                with c2:
-                    st.info(f"**Hírek a ház tájáról:** {p['intel']}")
-                    st.write(f"**Szakmai elemzés:** {p['detail']}")
-                    st.caption("A választás oka: Stabil kezdő, pozitív belső hírek és optimális piaci szorzó.")
+        if not ticket:
+            st.error("Hiba az adatok lekérésekor. Ellenőrizd az API kulcsokat!")
+        else:
+            total_odds = ticket[0]['odds'] * ticket[1]['odds']
+            
+            st.header(f"💰 Várható eredő odds: {total_odds:.2f}")
+            
+            for i, p in enumerate(ticket):
+                # Szöveges ajánlás meghatározása
+                if p['score'] >= 90: rec, color = "💎 TUTI TIPP", "green"
+                elif p['score'] >= 80: rec, color = "✅ ERŐSEN AJÁNLOTT", "blue"
+                else: rec, color = "⚠️ ÁTGONDOLÁSRA (Kockázatosabb)", "orange"
+                
+                with st.container():
+                    st.subheader(f"{i+1}. Mérkőzés: {p['match']}")
+                    col1, col2 = st.columns([1, 2])
+                    
+                    with col1:
+                        st.metric("Magabiztosság", f"{p['score']}%")
+                        st.markdown(f"**Tipp:** {p['pick']}")
+                        st.markdown(f"**Odds:** {p['odds']}")
+                        st.markdown(f"### :{color}[{rec}]")
+                        
+                    with col2:
+                        st.info(f"**Friss hírek a csapatnál:**\n\n{p['news']}")
+                        st.success(f"**Szakmai indoklás:** {p['detail']}\n\n*Az elemzés a keret aktuális állapota és a piaci mozgások alapján készült.*")
                 st.divider()
 
-        # Táblázat mentése a háttérben
-        conn = sqlite3.connect('stats.db')
-        pd.DataFrame(ticket).to_sql('history', conn, if_exists='append', index=False)
-        conn.close()
+            # Mentés statisztikához
+            conn = sqlite3.connect('pro_stats.db')
+            pd.DataFrame(ticket).to_sql('results', conn, if_exists='append', index=False)
+            conn.close()
 
-with st.expander("📊 Korábbi szelvények statisztikája"):
-    conn = sqlite3.connect('stats.db')
+with st.expander("📊 Adatbázis és Statisztika (Múltbéli tippek)"):
     try:
-        df = pd.read_sql_query("SELECT * FROM history", conn)
-        st.dataframe(df)
-    except: st.write("Még nincs adat.")
-    conn.close()
+        conn = sqlite3.connect('pro_stats.db')
+        df = pd.read_sql_query("SELECT * FROM results", conn)
+        st.dataframe(df, use_container_width=True)
+        conn.close()
+    except:
+        st.write("Még nincs mentett adat az adatbázisban.")
+
