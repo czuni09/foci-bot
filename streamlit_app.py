@@ -4,172 +4,232 @@ import sqlite3
 import pandas as pd
 import random
 from datetime import datetime, timedelta, timezone
+from requests.adapters import HTTPAdapter, Retry
 
-# --- ALAPVETŐ KONFIGURÁCIÓ ---
+# =======================
+# KONFIGURÁCIÓ
+# =======================
 try:
     API_KEY = st.secrets["ODDS_API_KEY"]
-    WEATHER_KEY = st.secrets["WEATHER_API_KEY"]
     NEWS_KEY = st.secrets["NEWS_API_KEY"]
-except:
-    st.error("Hiba: Hiányzó API kulcsok a Secrets-ben!")
+except KeyError:
+    st.error("❌ Hiányzó API kulcs a Streamlit Secrets-ben.")
     st.stop()
 
-# --- ADATBÁZIS MODUL ---
+TIMEOUT = (3, 10)  # connect / read
+TTL_API = 900      # 15 perc cache
+DB_NAME = "titan_betting.db"
+
+# =======================
+# HTTP SESSION (RETRY + RATE LIMIT BARÁT)
+# =======================
+@st.cache_resource
+def get_http_session():
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+SESSION = get_http_session()
+
+# =======================
+# ADATBÁZIS
+# =======================
+@st.cache_resource
 def init_db():
-    conn = sqlite3.connect('titan_betting.db')
-    conn.execute('''CREATE TABLE IF NOT EXISTS history 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, match TEXT, 
-                  pick TEXT, market TEXT, odds REAL, score INTEGER, summary TEXT)''')
-    conn.close()
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            match TEXT,
+            pick TEXT,
+            market TEXT,
+            odds REAL,
+            score INTEGER,
+            summary TEXT
+        )
+    """)
+    conn.commit()
+    return conn
 
-init_db()
+DB = init_db()
 
-# --- SZAKMAI INTELLIGENCIA MODULOK ---
-
-def get_market_analysis(team_name, market_type="h2h"):
-    """
-    Szimulált statisztikai motor a szögletekhez és lapokhoz, 
-    mivel az ingyenes API-k korlátozottan adják át ezeket élőben.
-    """
-    stats = {
-        "corners_avg": round(random.uniform(8.5, 12.5), 1),
-        "cards_avg": round(random.uniform(3.2, 5.8), 1),
-        "attacking_index": random.randint(60, 95)
+# =======================
+# SZIMULÁLT STAT MODULOK
+# =======================
+def market_simulation():
+    return {
+        "corners": round(random.uniform(8.5, 12.5), 1),
+        "cards": round(random.uniform(3.2, 5.8), 1),
+        "attack_index": random.randint(60, 95)
     }
-    return stats
 
-def get_referee_titan():
+def referee_profile():
     refs = [
-        {"name": "Michael Oliver", "yellow": 4.1, "red": 0.15, "style": "Szigorú, szögleteknél engedi a test-test elleni harcot."},
-        {"name": "Anthony Taylor", "yellow": 3.8, "red": 0.12, "style": "Kiszámítható, sokszor ítél büntetőt."},
-        {"name": "Danny Makkelie", "yellow": 3.5, "red": 0.08, "style": "Fluid játékot kedveli, kevés megszakítás."},
-        {"name": "Szymon Marciniak", "yellow": 4.5, "red": 0.20, "style": "Tekintélyelvű, a legkisebb szabálytalanságot is torolja."}
+        ("Michael Oliver", 4.1, "Szigorú, sok lap"),
+        ("Anthony Taylor", 3.8, "Stabil, büntető-hajlamos"),
+        ("Makkelie", 3.5, "Engedékeny"),
+        ("Marciniak", 4.5, "Autoriter")
     ]
-    return random.choice(refs)
+    name, y, style = random.choice(refs)
+    return {"name": name, "yellow_avg": y, "style": style}
 
-def get_news_and_players(team):
-    """Mély hírelemzés: Játékosok, sérültek, belső morál."""
+# =======================
+# HÍR ELEMZÉS (CACHE-ELT)
+# =======================
+@st.cache_data(ttl=TTL_API)
+def get_team_news(team):
     try:
-        url = f"https://newsapi.org/v2/everything?q={team} football injuries lineup&language=en&sortBy=publishedAt&pageSize=5&apiKey={NEWS_KEY}"
-        res = requests.get(url, timeout=5).json()
-        articles = res.get('articles', [])
+        url = (
+            "https://newsapi.org/v2/everything?"
+            f"q={team} football injury lineup&"
+            "language=en&pageSize=3&sortBy=publishedAt&"
+            f"apiKey={NEWS_KEY}"
+        )
+        r = SESSION.get(url, timeout=TIMEOUT)
+        r.raise_for_status()
+        articles = r.json().get("articles", [])
         if not articles:
-            return "Nincs friss hír.", 0, "A keret stabil."
-        
-        content = (articles[0]['title'] + " " + (articles[0]['description'] or "")).lower()
-        score_mod = 0
-        detail = "A csapat alapfelállása várható."
+            return 0, "Nincs releváns hír."
 
-        # Kulcsszó alapú játékos-analízis
-        if any(w in content for w in ['injury', 'out', 'missing', 'absent', 'surgery']):
-            score_mod -= 25
-            detail = "🚨 KRITIKUS: Kulcsjátékos(ok) hiányoznak a keretből, ami befolyásolja a támadójátékot és a szögletarányt."
-        if any(w in content for w in ['back', 'fit', 'return', 'boost']):
-            score_mod += 15
-            detail = "📈 POZITÍV: Fontos visszatérők az edzésmunkában, megnövekedett győzelmi esélyek."
-            
-        return articles[0]['title'], score_mod, detail
-    except:
-        return "Hírek nem elérhetőek.", 0, "Adathiányos elemzés."
+        text = (articles[0]["title"] or "").lower()
+        if any(w in text for w in ["injury", "out", "absent", "surgery"]):
+            return -25, "🚨 Kulcsjátékos hiány"
+        if any(w in text for w in ["return", "back", "fit"]):
+            return +15, "📈 Fontos visszatérő"
 
-# --- FŐ ELEMZŐ MOTOR ---
+        return 0, "Semleges hírek"
+    except Exception:
+        return 0, "Híradat nem elérhető"
+
+# =======================
+# ODDS LEKÉRÉS (CACHE)
+# =======================
+@st.cache_data(ttl=TTL_API)
+def fetch_odds(league):
+    url = (
+        f"https://api.the-odds-api.com/v4/sports/{league}/odds"
+        f"?apiKey={API_KEY}&regions=eu&markets=h2h"
+    )
+    r = SESSION.get(url, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+# =======================
+# TITAN ENGINE
+# =======================
 class TitanEngine:
-    def __init__(self):
-        self.leagues = ['soccer_epl', 'soccer_championship', 'soccer_spain_la_liga', 'soccer_italy_serie_a', 'soccer_germany_bundesliga']
+    LEAGUES = [
+        "soccer_epl",
+        "soccer_spain_la_liga",
+        "soccer_italy_serie_a",
+        "soccer_germany_bundesliga"
+    ]
 
-    def analyze_all(self):
-        all_picks = []
-        for lg in self.leagues:
-            url = f"https://api.the-odds-api.com/v4/sports/{lg}/odds?apiKey={API_KEY}&regions=eu&markets=h2h"
+    def analyze(self):
+        now = datetime.now(timezone.utc)
+        results = []
+
+        for lg in self.LEAGUES:
             try:
-                data = requests.get(url).json()
-                for m in data:
-                    # SZIGORÚ 24 ÓRÁS SZŰRŐ
-                    now = datetime.now(timezone.utc)
-                    kickoff = datetime.fromisoformat(m['commence_time'].replace('Z', '+00:00'))
-                    if kickoff < now or kickoff > now + timedelta(hours=24): continue
+                matches = fetch_odds(lg)
+                for m in matches:
+                    kickoff = datetime.fromisoformat(
+                        m["commence_time"].replace("Z", "+00:00")
+                    )
+                    if not (now <= kickoff <= now + timedelta(hours=24)):
+                        continue
 
-                    bookie = next((b for b in m.get('bookmakers', []) if b['key'] == 'bet365'), m['bookmakers'][0] if m.get('bookmakers') else None)
-                    if not bookie: continue
-                    
-                    market = next((mk for mk in bookie['markets'] if mk['key'] == 'h2h'), None)
-                    fav = min(market['outcomes'], key=lambda x: x['price'])
-                    
-                    # KOMPLEX STATISZTIKAI ÉRTÉKELÉS
-                    news_h, news_mod, news_d = get_news_and_players(fav['name'])
-                    m_stats = get_market_analysis(fav['name'])
-                    ref = get_referee_titan()
-                    
-                    # Összetett pontszám (Odds + Hírek + Szögletpotenciál)
-                    final_score = 70 + news_mod + (m_stats['attacking_index'] / 5)
-                    
-                    all_picks.append({
-                        'match': f"{m['home_team']} vs {m['away_team']}",
-                        'pick': fav['name'],
-                        'odds': fav['price'],
-                        'score': min(99, max(5, int(final_score))),
-                        'news': news_h,
-                        'detail': news_d,
-                        'corners': m_stats['corners_avg'],
-                        'cards': m_stats['cards_avg'],
-                        'referee': ref
+                    bookies = m.get("bookmakers", [])
+                    if not bookies:
+                        continue
+
+                    market = bookies[0]["markets"][0]
+                    fav = min(market["outcomes"], key=lambda x: x["price"])
+
+                    if not 1.30 <= fav["price"] <= 1.80:
+                        continue
+
+                    news_mod, news_txt = get_team_news(fav["name"])
+                    stats = market_simulation()
+                    ref = referee_profile()
+
+                    score = int(
+                        70 +
+                        news_mod +
+                        (stats["attack_index"] / 5)
+                    )
+
+                    results.append({
+                        "match": f"{m['home_team']} vs {m['away_team']}",
+                        "pick": fav["name"],
+                        "odds": fav["price"],
+                        "score": max(5, min(99, score)),
+                        "news": news_txt,
+                        "corners": stats["corners"],
+                        "cards": stats["cards"],
+                        "ref": ref
                     })
-            except: continue
-        return sorted(all_picks, key=lambda x: x['score'], reverse=True)
+            except Exception:
+                continue
 
-# --- FELHASZNÁLÓI FELÜLET ---
-st.set_page_config(page_title="TITAN V13.0", layout="wide")
-st.title("🦾 Football Intelligence V13.0 TITAN MONSTRUM")
-st.subheader("Mélystatisztika: Végkimenetel + Szögletek + Lapok + Keretanalízis")
+        return sorted(results, key=lambda x: x["score"], reverse=True)
 
-if st.button("🚀 TELJES RENDSZERELEMZÉS INDÍTÁSA"):
+# =======================
+# STREAMLIT UI
+# =======================
+st.set_page_config("TITAN V13.1", layout="wide")
+st.title("🦾 TITAN Football Intelligence V13.1")
+
+if st.button("🚀 Elemzés indítása"):
     engine = TitanEngine()
-    results = engine.analyze_all()
-    
-    if not results:
-        st.error("Nincs mérkőzés a következő 24 órában.")
+    data = engine.analyze()
+
+    if not data:
+        st.warning("Nincs releváns mérkőzés a következő 24 órában.")
     else:
-        # Dupla szelvény generálás
-        ticket = results[:2]
-        total_odds = ticket[0]['odds'] * ticket[1]['odds'] if len(ticket) >= 2 else ticket[0]['odds']
-        
-        st.header(f"🎫 Javasolt Dupla Szelvény | Eredő szorzó: {total_odds:.2f}")
-        
-        # Kért figyelmeztető szöveg, ha nincs tökéletes tipp
-        if any(p['score'] < 90 for p in ticket):
-            st.warning("⚠️ JELENTÉS: Ma nincs 90% feletti (TUTI) kínálat, de ez a két mérkőzés áll hozzá statisztikailag a legközelebb.")
+        ticket = data[:2]
+        total_odds = round(ticket[0]["odds"] * ticket[1]["odds"], 2)
 
-        for i, p in enumerate(ticket):
-            with st.expander(f"{i+1}. {p['match']} | {p['score']}% MAGABIZTOSSÁG", expanded=True):
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("PONTOSSÁG", f"{p['score']}%")
-                    st.write(f"**Tipp:** {p['pick']}")
-                    st.write(f"**Odds:** {p['odds']}")
-                with col2:
-                    st.write("**📊 Statisztikai Várható:**")
-                    st.write(f"📐 Szögletek: {p['corners']}")
-                    st.write(f"🟨 Lapok: {p['cards']}")
-                    st.write(f"👨‍⚖️ Bíró: {p['referee']['name']}")
-                with col3:
-                    st.write("**📰 Játékos-hírek:**")
-                    st.caption(p['news'])
-                    st.info(p['detail'])
-                
-                st.caption(f"🛡️ **Bírói profil:** {p['referee']['style']}")
-        
-        # Mentés az adatbázisba
-        conn = sqlite3.connect('titan_betting.db')
+        st.header(f"🎫 Dupla szelvény | Odds: {total_odds}")
+
+        if any(p["score"] < 90 for p in ticket):
+            st.warning("⚠️ Ma nincs 90%+ TUTI ajánlat.")
+
         for p in ticket:
-            conn.execute("INSERT INTO history (timestamp, match, pick, market, odds, score, summary) VALUES (?,?,?,?,?,?,?)",
-                         (datetime.now().strftime("%Y-%m-%d %H:%M"), p['match'], p['pick'], "H2H+Stats", p['odds'], p['score'], p['detail']))
-        conn.commit()
-        conn.close()
+            st.write(
+                f"**{p['match']}** → {p['pick']} | "
+                f"{p['odds']} | {p['score']}%"
+            )
+            st.caption(
+                f"Szögletek: {p['corners']} | "
+                f"Lapok: {p['cards']} | "
+                f"Bíró: {p['ref']['name']}"
+            )
+            st.info(p["news"])
 
-with st.expander("📊 Adatbázis (Múltbéli elemzések táblázata)"):
-    try:
-        conn = sqlite3.connect('titan_betting.db')
-        df = pd.read_sql_query("SELECT * FROM history ORDER BY id DESC", conn)
-        st.dataframe(df, use_container_width=True)
-        conn.close()
-    except: st.write("Még nincs adat az adatbázisban.")
+            DB.execute(
+                "INSERT INTO history VALUES (NULL,?,?,?,?,?,?)",
+                (
+                    datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    p["match"],
+                    p["pick"],
+                    "H2H",
+                    p["odds"],
+                    p["score"],
+                    p["news"]
+                )
+            )
+        DB.commit()
+
+st.subheader("📊 Előzmények")
+df = pd.read_sql("SELECT * FROM history ORDER BY id DESC", DB)
+st.dataframe(df, use_container_width=True)
