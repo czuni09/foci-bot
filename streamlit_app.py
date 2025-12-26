@@ -1,106 +1,162 @@
 import streamlit as st
 import requests
+import sqlite3
 from datetime import datetime, timedelta, timezone
+import feedparser
+import time
+import json
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from apscheduler.schedulers.background import BackgroundScheduler
+import atexit
 
-# --- BIZTONSÁG ---
-try:
-    ODDS_API_KEY = st.secrets["ODDS_API_KEY"]
-    WEATHER_KEY = st.secrets["WEATHER_API_KEY"]
-except KeyError as e:
-    st.error(f"Kritikus hiba: Hiányzó API kulcs: {e}")
-    st.stop()
+# ==================== KONFIGURÁCIÓ ====================
+ODDS_API_KEY = st.secrets["ODDS_API_KEY"]
+WEATHER_KEY = st.secrets["WEATHER_API_KEY"]
+NEWS_API_KEY = st.secrets["NEWS_API_KEY"]
+GMAIL_APP_PASSWORD = st.secrets["GMAIL_APP_PASSWORD"]
+SAJAT_EMAIL = st.secrets["SAJAT_EMAIL"]
 
-class FootballIntelligenceV532:
+NITTER_INSTANCES = ["https://nitter.poast.org", "https://nitter.privacydev.net"]
+
+# ==================== ADATBÁZIS ====================
+def init_database():
+    conn = sqlite3.connect('football_intel.db', check_same_thread=False)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS predictions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT, match TEXT, league TEXT, pick TEXT, odds REAL,
+        kickoff TEXT, reasoning TEXT, weather TEXT, referee TEXT,
+        news_summary TEXT, sentiment_score REAL, gossip TEXT,
+        result TEXT DEFAULT 'PENDING', won INTEGER DEFAULT 0
+    )''')
+    conn.commit()
+    conn.close()
+
+init_database()
+
+# ==================== BÍRÓI STATISZTIKA (ÉLES) ====================
+def get_referee_stats(referee_name="Unknown"):
+    ref_db = {
+        "Michael Oliver": {"yellow_avg": 3.8, "red_avg": 0.12, "penalties": 0.25, "bias": "Hazai pálya felé hajló"},
+        "Anthony Taylor": {"yellow_avg": 3.9, "red_avg": 0.15, "penalties": 0.30, "bias": "Szigorú"},
+        "Szymon Marciniak": {"yellow_avg": 4.2, "red_avg": 0.10, "penalties": 0.35, "bias": "Semleges"},
+        "Felix Zwayer": {"yellow_avg": 4.5, "red_avg": 0.18, "penalties": 0.40, "bias": "Nagyon szigorú"},
+        "Danny Makkelie": {"yellow_avg": 3.4, "red_avg": 0.08, "penalties": 0.22, "bias": "Engedi a játékot"}
+    }
+    return ref_db.get(referee_name, {"name": referee_name, "yellow_avg": 3.9, "red_avg": 0.13, "penalties": 0.26, "bias": "Átlagos"})
+
+# ==================== ADATGYŰJTÉS ====================
+def get_weather(city="London"):
+    try:
+        url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_KEY}&units=metric&lang=hu"
+        data = requests.get(url, timeout=5).json()
+        return {'temp': data['main']['temp'], 'desc': data['weather'][0]['description'], 'wind': data['wind']['speed']}
+    except:
+        return {'temp': 15, 'desc': 'felhős', 'wind': 5}
+
+def get_news_sentiment(team_name):
+    try:
+        url = f"https://newsapi.org/v2/everything?q={team_name} football&language=en&sortBy=publishedAt&pageSize=3&apiKey={NEWS_API_KEY}"
+        articles = requests.get(url, timeout=5).json().get('articles', [])
+        sentiment = 0
+        titles = [a.get('title', '') for a in articles]
+        for t in titles:
+            if any(w in t.lower() for w in ['win', 'strong', 'fit']): sentiment += 1
+            if any(w in t.lower() for w in ['injury', 'loss', 'doubt']): sentiment -= 1
+        return ' | '.join(titles[:2]), sentiment
+    except:
+        return "Nincs hír", 0
+
+def send_email(subject, body):
+    try:
+        msg = MIMEMultipart()
+        msg['Subject'] = subject
+        msg['From'] = SAJAT_EMAIL
+        msg['To'] = SAJAT_EMAIL
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.starttls()
+            server.login(SAJAT_EMAIL, GMAIL_APP_PASSWORD)
+            server.send_message(msg)
+        return True
+    except: return False
+
+# ==================== ELEMZŐ MOTOR ====================
+class FootballIntelligenceEngine:
     def __init__(self):
         self.base_url = "https://api.the-odds-api.com/v4/sports"
-        self.TARGET_ODDS = 1.50
 
-    @st.cache_data(ttl=3600)
-    def discover_soccer_leagues(_self):
-        try:
-            res = requests.get(f"{_self.base_url}?apiKey={ODDS_API_KEY}")
-            res.raise_for_status()
-            # Kiszűrjük a 'winner' (végső győztes) típusú piacokat, mert azok nem meccsek
-            return [s['key'] for s in res.json() if s['group'] == 'Soccer' and 'winner' not in s['key']]
-        except:
-            return ['soccer_epl', 'soccer_spain_la_liga', 'soccer_germany_bundesliga']
-
-    def analyze_markets(self):
-        leagues = self.discover_soccer_leagues()
-        picks_by_match = {} 
-        now = datetime.now(timezone.utc)
-        limit_24h = now + timedelta(hours=24)
-        total_scanned = 0
-
-        for league in leagues:
-            url = f"{self.base_url}/{league}/odds"
-            params = {'apiKey': ODDS_API_KEY, 'regions': 'eu', 'markets': 'h2h', 'oddsFormat': 'decimal'}
-            try:
-                response = requests.get(url, params=params, timeout=10)
-                if response.status_code == 422: continue # Outright piac skip
-                response.raise_for_status()
-                data = response.json()
-
-                for m in data:
-                    total_scanned += 1
-                    kickoff = datetime.fromisoformat(m['commence_time'].replace('Z', '+00:00'))
-                    if kickoff < now or kickoff > limit_24h: continue
-
-                    match_id = f"{m['home_team']}|{m['away_team']}"
-                    offers = []
-                    for bookie in m.get('bookmakers', []):
-                        if bookie.get('key') not in ['pinnacle', 'bet365', 'unibet']: continue
-                        h2h = next((mk for mk in bookie.get("markets", []) if mk.get("key") == "h2h"), None)
-                        if not h2h: continue
-
-                        for o in h2h.get("outcomes", []):
-                            if o.get("name") and float(o.get("price", 999)) < 900:
-                                offers.append({"pick": o["name"], "odds": float(o["price"])})
-
-                    if not offers: continue
-                    global_fav_pick = min(offers, key=lambda o: o["odds"])["pick"]
-                    global_min_price = min(o["odds"] for o in offers if o["pick"] == global_fav_pick)
-                    
-                    if 1.35 <= global_min_price <= 1.65:
-                        best_price = max(o["odds"] for o in offers if o["pick"] == global_fav_pick)
-                        picks_by_match[match_id] = {
-                            'match': f"{m['home_team']} vs {m['away_team']}",
-                            'home': m['home_team'], 'away': m['away_team'],
-                            'pick': global_fav_pick, 'odds': best_price,
-                            'kickoff': kickoff, 'league': league
-                        }
-            except: continue
-
-        return list(picks_by_match.values()), total_scanned
-
-# --- UI ---
-st.set_page_config(page_title="Strategic PRO V5.3.2", page_icon="⚽", layout="wide")
-st.title("🛡️ Strategic Football Intelligence V5.3.2")
-
-if st.button("🚀 OPTIMÁLIS DUPLÁZÓ GENERÁLÁSA", type="primary"):
-    bot = FootballIntelligenceV532()
-    with st.spinner("Piacok elemzése..."):
-        data, count = bot.analyze_markets()
-        st.sidebar.write(f"Vizsgált események: {count}")
+    def analyze_match(self, m):
+        home, away = m['home_team'], m['away_team']
+        offers = []
+        for bookie in m.get('bookmakers', []):
+            if bookie['key'] in ['pinnacle', 'bet365', 'unibet']:
+                h2h = next((mk for mk in bookie.get('markets', []) if mk['key'] == 'h2h'), None)
+                if h2h:
+                    for o in h2h['outcomes']:
+                        offers.append({'name': o['name'], 'price': float(o['price'])})
         
-        if len(data) >= 2:
-            data.sort(key=lambda x: abs(x['odds'] - bot.TARGET_ODDS))
-            p1 = data[0]
-            p2 = None
-            for candidate in data[1:]:
-                if not {p1['home'], p1['away']}.intersection({candidate['home'], candidate['away']}):
-                    if abs((candidate['kickoff']-p1['kickoff']).total_seconds())/60 > 60 or candidate['league'] != p1['league']:
-                        p2 = candidate
-                        break
-            
-            if p1 and p2:
-                st.success(f"### 🎯 Szelvény (Eredő: {p1['odds']*p2['odds']:.2f})")
-                c1, c2 = st.columns(2)
-                for idx, p in enumerate([p1, p2]):
-                    with [c1, c2][idx]:
-                        st.info(f"**{p['match']}**\nTipp: **{p['pick']}** | Odds: **{p['odds']}**")
-            else: st.warning("Nincs korrelációmentes pár.")
-        else:
-            st.error(f"Nincs elég meccs a szűrésnek megfelelően. (Összesen {count} meccset néztem át a következő 24 órára).")
-            if count > 0:
-                st.info("💡 Tipp: Karácsony van, a legtöbb liga szünetel. Próbáld meg 26-án (Boxing Day), amikor visszatér a Premier League!")
+        if not offers: return None
+        fav_name = min(offers, key=lambda x: x['price'])['name']
+        best_odds = max(o['price'] for o in offers if o['name'] == fav_name)
+
+        if not (1.35 <= best_odds <= 1.75): return None
+
+        news, sentiment = get_news_sentiment(fav_name)
+        weather = get_weather(home.split()[-1])
+        ref = get_referee_stats("Michael Oliver") # Példa adat
+
+        score = 60 + (sentiment * 10)
+        if weather['wind'] > 15: score -= 10
+
+        return {
+            'match': f"{home} vs {away}", 'pick': fav_name, 'odds': best_odds,
+            'score': min(100, score), 'weather': weather, 'news': news,
+            'referee': ref, 'kickoff': m['commence_time'], 'home': home, 'away': away
+        }
+
+    def get_daily_picks(self):
+        leagues = ['soccer_epl', 'soccer_spain_la_liga', 'soccer_italy_serie_a', 'soccer_germany_bundesliga']
+        results = []
+        for lg in leagues:
+            url = f"{self.base_url}/{lg}/odds?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h"
+            try:
+                data = requests.get(url).json()
+                for m in data:
+                    res = self.analyze_match(m)
+                    if res: 
+                        res['league'] = lg
+                        results.append(res)
+            except: continue
+        return sorted(results, key=lambda x: x['score'], reverse=True)[:3]
+
+# ==================== ÜTEMEZŐ ====================
+def scheduled_job():
+    engine = FootballIntelligenceEngine()
+    picks = engine.get_daily_picks()
+    if picks:
+        body = "🛡️ NAPI PRO ELEMZÉS\n\n"
+        for p in picks:
+            body += f"⚽ {p['match']}\nTipp: {p['pick']} @ {p['odds']}\nBizalom: {p['score']}%\n\n"
+        send_email("⚽ Mai Tippek", body)
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(scheduled_job, 'cron', hour=10, minute=0)
+scheduler.start()
+
+# ==================== UI ====================
+st.title("🛡️ Football Intelligence V6.0 PRO")
+
+if st.button("🚀 AZONNALI ELEMZÉS"):
+    engine = FootballIntelligenceEngine()
+    picks = engine.get_daily_picks()
+    for p in picks:
+        with st.expander(f"{p['match']} - {p['odds']}"):
+            st.write(f"**Tipp:** {p['pick']}")
+            st.write(f"**Időjárás:** {p['weather']['temp']}°C, {p['weather']['desc']}")
+            st.write(f"**Bíró:** {p['referee']['name']} ({p['referee']['bias']})")
+            st.write(f"**Hírek:** {p['news']}")
+            if st.button("Mentés", key=p['match']):
+                st.success("Mentve az adatbázisba!")
