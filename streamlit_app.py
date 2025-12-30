@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import re
 import time
@@ -32,7 +34,6 @@ TOTAL_ODDS_MAX = 2.10
 TARGET_LEG_ODDS = sqrt(2)
 
 # Odds API v4: dokumentált alappiacok
-# (totals/spreads nem mindig elérhető soccerre minden booknál)
 REQUEST_MARKETS = ["h2h", "totals", "spreads"]
 
 DEFAULT_LEAGUES = [
@@ -288,7 +289,6 @@ def fd_settle_prediction(pred_row: dict) -> dict:
     line = pred_row.get("line")
 
     if bet_type == "H2H":
-        # Döntetlen = LOST (nem DNB)
         if team_match_score(selection, pred_row.get("home", "")) >= 0.7:
             res = "WON" if hg > ag else "LOST"
         elif team_match_score(selection, pred_row.get("away", "")) >= 0.7:
@@ -303,7 +303,6 @@ def fd_settle_prediction(pred_row: dict) -> dict:
         except Exception:
             return {"result": "UNKNOWN", "home_goals": int(hg), "away_goals": int(ag)}
 
-        # Push -> VOID (ha pontosan a line)
         if abs(total - ln) < 1e-9:
             res = "VOID"
         else:
@@ -464,7 +463,6 @@ def odds_api_get(league_key: str, markets: list[str], regions: str = "eu"):
             "x-requests-last": r.headers.get("x-requests-last"),
         }
         if r.status_code != 200:
-            # 401 / quota / stb: NE dobjunk hibát, csak visszaadjuk
             detail = ""
             try:
                 detail = (r.text or "")[:500]
@@ -508,8 +506,7 @@ def extract_candidates_from_match(m: dict, min_odds: float, max_odds: float) -> 
     # ---------- H2H ----------
     h2h_blocks = collect_prices("h2h")
     team_prices = {home: [], away: []}
-    draw_prices = []  # ha 3-way
-    for bk, outs in h2h_blocks:
+    for _bk, outs in h2h_blocks:
         for o in outs:
             nm = o.get("name")
             pr = safe_float(o.get("price"))
@@ -519,11 +516,8 @@ def extract_candidates_from_match(m: dict, min_odds: float, max_odds: float) -> 
                 team_prices[home].append(pr)
             elif nm == away:
                 team_prices[away].append(pr)
-            elif str(nm).lower() == "draw":
-                draw_prices.append(pr)
 
     if team_prices[home] and team_prices[away]:
-        # favorit: kisebb átlag odds
         avg_home = sum(team_prices[home]) / len(team_prices[home])
         avg_away = sum(team_prices[away]) / len(team_prices[away])
         fav = home if avg_home < avg_away else away
@@ -553,7 +547,7 @@ def extract_candidates_from_match(m: dict, min_odds: float, max_odds: float) -> 
     # ---------- TOTALS ----------
     totals_blocks = collect_prices("totals")
     totals_map = {}  # (point, name)-> list[price]
-    for bk, outs in totals_blocks:
+    for _bk, outs in totals_blocks:
         for o in outs:
             nm = (o.get("name") or "").strip().capitalize()  # Over/Under
             pt = safe_float(o.get("point"))
@@ -597,7 +591,7 @@ def extract_candidates_from_match(m: dict, min_odds: float, max_odds: float) -> 
     # ---------- SPREADS ----------
     spreads_blocks = collect_prices("spreads")
     spreads_map = {}  # (point, teamname)-> list[price]
-    for bk, outs in spreads_blocks:
+    for _bk, outs in spreads_blocks:
         for o in outs:
             nm = o.get("name")
             pt = safe_float(o.get("point"))
@@ -741,7 +735,6 @@ def pick_best_duo(cands: list[dict]) -> tuple[list[dict], float]:
                 best = (i, j, util, total_odds)
 
     if best[0] is None:
-        # fallback: top2 score (ha nincs 2.00 körüli)
         top2 = sorted(cands, key=lambda x: x.get("score", 0.0), reverse=True)[:2]
         if len(top2) < 2:
             return [], 0.0
@@ -784,7 +777,7 @@ def save_ticket(ticket: list[dict]):
                 float(t.get("score", 0.0)),
                 t.get("reasoning"),
                 t.get("football_data_match_id"),
-                float(t.get("odds", 0.0)),  # opening = aktuális (fogadás előtti)
+                float(t.get("odds", 0.0)),  # opening = aktuális
                 None,
                 None,
                 "LIVE",
@@ -796,10 +789,10 @@ def save_ticket(ticket: list[dict]):
 
 def update_clv_for_pending(regions: str, markets: list[str]):
     """
-    CLV frissítés csak akkor, ha az Odds API él.
-    - Megkeresi a pending tippeket, amik 0-3 órán belül kezdődnek vagy már elkezdődtek.
-    - Újra lekéri az oddsot ugyanahhoz a ligához/meccshez és selectionhöz (best_of),
-      majd closing_odds és clv_percent frissítés.
+    CLV frissítés:
+    - pending tippek, amik 0-3 órán belül kezdődnek vagy már elkezdődtek
+    - újra lekéri a ligát, match+selection alapján best closing odds
+    - closing_odds + clv_percent frissítés
     """
     if not ODDS_API_KEY:
         return 0, "Nincs ODDS_API_KEY, CLV nem frissíthető."
@@ -807,7 +800,8 @@ def update_clv_for_pending(regions: str, markets: list[str]):
     con = db()
     df = pd.read_sql_query(
         """
-        SELECT id, league, match, home, away, kickoff_utc, bet_type, market_key, selection, line, opening_odds, closing_odds, clv_percent
+        SELECT id, league, match, home, away, kickoff_utc, bet_type, market_key, selection, line,
+               opening_odds, closing_odds, clv_percent
         FROM predictions
         WHERE result='PENDING'
         ORDER BY id DESC
@@ -826,7 +820,6 @@ def update_clv_for_pending(regions: str, markets: list[str]):
         ko = iso_to_dt(r.get("kickoff_utc", ""))
         if not ko:
             continue
-        # csak közel a kezdéshez (CLV)
         if ko < now - timedelta(hours=3) or ko > now + timedelta(hours=3):
             continue
         targets.append(r.to_dict())
@@ -835,7 +828,6 @@ def update_clv_for_pending(regions: str, markets: list[str]):
         return 0, ""
 
     updated = 0
-    # Ligánként egyszer kérünk, quota kímélés
     by_league = {}
     for t in targets:
         lg = t.get("league") or ""
@@ -844,13 +836,13 @@ def update_clv_for_pending(regions: str, markets: list[str]):
     for lg, rows in by_league.items():
         if not lg:
             continue
+
         resp = odds_api_get(lg, markets, regions=regions)
         if not resp.get("ok"):
             return updated, f"CLV: Odds API nem elérhető ({resp.get('status')})."
 
         events = resp.get("events", []) or []
 
-        # eseményből visszaépítjük a jelöltjeinket, és match+selection alapján megkeressük a best oddst
         for row in rows:
             home = row.get("home", "")
             away = row.get("away", "")
@@ -866,18 +858,16 @@ def update_clv_for_pending(regions: str, markets: list[str]):
                 ek = iso_to_dt(ev.get("commence_time"))
                 if not eh or not ea or not ek or not ko:
                     continue
-                # egyeztetés: csapatok + kickoff közelség
                 if abs((ek - ko).total_seconds()) > 3 * 3600:
                     continue
                 if (team_match_score(eh, home) + team_match_score(ea, away)) / 2.0 < 0.75:
                     continue
 
-                # ebből a meccsből jelöltek
                 cands = extract_candidates_from_match(ev, min_odds=1.01, max_odds=100.0)
-                # kiválasztjuk a megfelelőt
                 for c in cands:
                     if c.get("bet_type") != bet_type:
                         continue
+
                     if bet_type == "H2H":
                         if team_match_score(c.get("selection", ""), selection) < 0.9:
                             continue
@@ -903,7 +893,7 @@ def update_clv_for_pending(regions: str, markets: list[str]):
 
             opening = safe_float(row.get("opening_odds"))
             if opening and best:
-                clv = ((opening - best) / opening) * 100.0  # ha closing kisebb -> jó CLV (pozitív)
+                clv = ((opening - best) / opening) * 100.0  # closing kisebb -> jó CLV (pozitív)
             else:
                 clv = None
 
@@ -947,14 +937,7 @@ def run_analysis(leagues: list[str], window_hours: int, min_odds: float, max_odd
 
         if not resp.get("ok"):
             if debug:
-                debug_rows.append(
-                    (
-                        lg,
-                        resp.get("status", "ERR"),
-                        0,
-                        (resp.get("detail", "") or "")[:220],
-                    )
-                )
+                debug_rows.append((lg, resp.get("status", "ERR"), 0, (resp.get("detail", "") or "")[:220]))
             continue
 
         events = resp.get("events", []) or []
@@ -976,7 +959,6 @@ def run_analysis(leagues: list[str], window_hours: int, min_odds: float, max_odd
                 c["reasoning"] = reason
                 c["meta"] = meta
 
-                # football-data match id (settle-hez)
                 try:
                     mid = fd_find_match_id(c["home"], c["away"], c["kickoff"])
                 except Exception:
@@ -985,7 +967,7 @@ def run_analysis(leagues: list[str], window_hours: int, min_odds: float, max_odd
 
                 candidates.append(c)
 
-            time.sleep(0.02)
+            time.sleep(0.02)  # óvatos quota/terhelés
 
     candidates = sorted(candidates, key=lambda x: x.get("score", 0.0), reverse=True)
     ticket, total_odds = pick_best_duo(candidates)
@@ -1064,14 +1046,6 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; color: var(--text
   color: rgba(255,255,255,0.90);
   font-size: 0.86rem;
 }
-.kpi{
-  background: rgba(255,255,255,0.05);
-  border: 1px solid rgba(255,255,255,0.10);
-  border-radius: 16px;
-  padding: 12px 14px;
-}
-.kpi .t{ color: var(--muted); font-size: 0.86rem; margin-bottom: 4px;}
-.kpi .v{ font-weight: 800; font-size: 1.25rem;}
 .small{ color: var(--muted); font-size: 0.9rem; }
 hr{ border: none; border-top: 1px solid rgba(255,255,255,0.10); margin: 1rem 0; }
 </style>
@@ -1134,7 +1108,6 @@ if run_btn:
                 dbg = pd.DataFrame(res.get("debug_rows", []), columns=["league", "status", "events", "details"])
                 st.dataframe(dbg, use_container_width=True)
 
-# CLV gomb
 if clv_btn:
     with st.spinner("CLV frissítés… (csak Odds API él esetén)"):
         upd, msg = update_clv_for_pending(regions=regions, markets=REQUEST_MARKETS)
@@ -1142,7 +1115,6 @@ if clv_btn:
             st.warning(msg)
         st.success(f"CLV frissítve: {upd} rekord.")
 
-# Ticket megjelenítés
 if st.session_state["last_run"] is not None:
     res = st.session_state["last_run"]
     ticket = res.get("ticket", [])
@@ -1153,7 +1125,7 @@ if st.session_state["last_run"] is not None:
     if not ticket:
         st.warning(
             "Nincs ajánlható TOP 2, mert **nincs elérhető odds** (pl. quota/401), vagy nincs a szűrőknek megfelelő piac.\n\n"
-            "➡️ A rendszer nem hibázik: **odds nélkül nem ad tippet** (ahogy kérted)."
+            "➡️ A rendszer nem hibázik: **odds nélkül nem ad tippet**."
         )
     else:
         st.markdown(
@@ -1212,7 +1184,6 @@ if st.session_state["last_run"] is not None:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-# Mentés
 if save_btn:
     if st.session_state["last_run"] is None or not st.session_state["last_run"].get("ticket"):
         st.warning("Előbb futtasd az elemzést, hogy legyen TOP 2 (odds szükséges).")
@@ -1222,7 +1193,6 @@ if save_btn:
 
 st.markdown("---")
 
-# Valós meccsek panel (football-data) – mindig létező meccseket mutat
 st.subheader("📅 Valós meccsek az időablakban (football-data.org)")
 fixtures, fx_err = fd_fixtures_window(hours_ahead=int(window_hours))
 if fx_err:
@@ -1246,7 +1216,6 @@ else:
 
 st.markdown("---")
 
-# Előzmények + stat
 st.subheader("📜 Előzmények + statisztika")
 con = db()
 df = pd.read_sql_query(
@@ -1277,3 +1246,4 @@ if not df.empty:
     with c4:
         clv_mean = pd.to_numeric(df["clv_percent"], errors="coerce").dropna()
         st.metric("Átlag CLV%", f"{clv_mean.mean():.2f}%" if not clv_mean.empty else "—")
+
