@@ -5,6 +5,7 @@ import sqlite3
 from math import sqrt
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Dict, Any, Tuple
 
 import requests
 import pandas as pd
@@ -19,10 +20,8 @@ st.set_page_config(page_title="⚽ TITAN – Strategic Intelligence", layout="wi
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 WEATHER_KEY = os.getenv("WEATHER_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-FOOTBALL_DATA_KEY = os.getenv("FOOTBALL_DATA_KEY")
+FOOTBALL_DATA_KEY = os.getenv("FOOTBALL_DATA_KEY")  # itt most nem használjuk, de meghagyjuk
 
-# Odds nélkül is menjen (DEMO-hoz), ezért NEM stop-olunk rá,
-# csak jelzünk. A többi API is opcionális DEMO-hoz.
 DB_PATH = "titan.db"
 
 TARGET_TOTAL_ODDS = 2.00
@@ -51,6 +50,7 @@ def db():
     try:
         con.execute("PRAGMA journal_mode=WAL;")
         con.execute("PRAGMA synchronous=NORMAL;")
+        con.execute("PRAGMA busy_timeout=30000;")
     except Exception:
         pass
     return con
@@ -88,11 +88,12 @@ def init_db():
 
             closing_odds REAL,
             clv_percent REAL,
-
             data_quality TEXT
         )
         """
     )
+
+    # backward compatible: ha régi db van, oszlopok pótlása
     try:
         cur.execute("PRAGMA table_info(predictions)")
         cols = [r[1] for r in cur.fetchall()]
@@ -119,13 +120,16 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def iso_to_dt(s: str) -> datetime | None:
+def iso_to_dt(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 
-def safe_float(x, default=None):
+def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         return float(x)
     except Exception:
@@ -161,12 +165,12 @@ def team_match_score(a: str, b: str) -> float:
 
 
 # =========================================================
-#  Külső adatok (cache) – ha nincs kulcs, DEMO/0-val térünk vissza
+#  Külső adatok (cache) – ha nincs kulcs, DEMO/0
 # =========================================================
 @st.cache_data(ttl=600)
-def get_weather_basic(city_guess="London"):
+def get_weather_basic(city_guess: str = "London") -> Dict[str, Any]:
     if not WEATHER_KEY:
-        return {"temp": None, "desc": "nincs adat (DEMO)", "wind": None}
+        return {"temp": None, "desc": "nincs időjárás kulcs (DEMO)", "wind": None}
     try:
         url = "https://api.openweathermap.org/data/2.5/weather"
         params = {"q": city_guess, "appid": WEATHER_KEY, "units": "metric", "lang": "hu"}
@@ -183,7 +187,7 @@ def get_weather_basic(city_guess="London"):
 
 
 @st.cache_data(ttl=600)
-def news_brief(team_name: str):
+def news_brief(team_name: str) -> Dict[str, Any]:
     if not NEWS_API_KEY:
         return {"score": 0, "lines": ["• nincs NewsAPI kulcs (DEMO)"]}
     try:
@@ -193,34 +197,38 @@ def news_brief(team_name: str):
         r = requests.get(url, params=params, timeout=12)
         if r.status_code != 200:
             return {"score": 0, "lines": [f"• NewsAPI HTTP {r.status_code} (DEMO)"]}
+
         js = r.json()
         arts = js.get("articles", []) or []
         if not arts:
             return {"score": 0, "lines": []}
 
-        lines, score = [], 0
+        lines: List[str] = []
+        score = 0
         for a in arts[:2]:
             title = (a.get("title") or "").strip()
             src = (a.get("source") or {}).get("name", "ismeretlen")
             txt = (title + " " + (a.get("description") or "")).lower()
+
             if any(w in txt for w in ["injury", "injured", "out", "doubt", "suspended"]):
                 score -= 1
             if any(w in txt for w in ["return", "fit", "back", "boost"]):
                 score += 1
             if title:
                 lines.append(f"• {title} ({src})")
+
         return {"score": score, "lines": lines}
     except Exception:
         return {"score": 0, "lines": []}
 
 
 # =========================================================
-#  ODDS API (hibát visszaadjuk, hogy a UI tudjon DEMO-ra váltani)
+#  ODDS API
 # =========================================================
 @st.cache_data(ttl=120)
-def odds_api_get(league_key: str, markets: list[str], regions: str = "eu"):
+def odds_api_get(league_key: str, markets: List[str], regions: str = "eu") -> List[Dict[str, Any]]:
     if not ODDS_API_KEY:
-        raise requests.exceptions.HTTPError("Missing ODDS_API_KEY (DEMO)")
+        raise requests.exceptions.HTTPError("Hiányzó ODDS_API_KEY")
     url = f"https://api.the-odds-api.com/v4/sports/{league_key}/odds"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -230,32 +238,32 @@ def odds_api_get(league_key: str, markets: list[str], regions: str = "eu"):
     }
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    return data if isinstance(data, list) else []
 
 
 # =========================================================
-#  Jelöltek generálása valódi odds-ból
+#  Jelöltek (LIVE)
 # =========================================================
-def extract_candidates_from_match(m: dict, min_odds: float, max_odds: float) -> list[dict]:
-    out = []
+def extract_candidates_from_match(m: Dict[str, Any], min_odds: float, max_odds: float) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
     home = m.get("home_team")
     away = m.get("away_team")
     kickoff = iso_to_dt(m.get("commence_time"))
-
     if not home or not away or not kickoff:
         return out
 
     bookmakers = m.get("bookmakers", []) or []
 
-    def avg_best(prices: list[float]):
+    def avg_best(prices: List[float]) -> Tuple[Optional[float], Optional[float]]:
         if not prices:
             return None, None
         avg = sum(prices) / len(prices)
         best = max(prices)
         return avg, best
 
-    # H2H: favorit (legalacsonyabb átlag) + best_of odds
-    h2h_prices = {}
+    # ---- H2H: favorit (legalacsonyabb átlag), és arra a legjobb odds
+    h2h_prices: Dict[str, List[float]] = {}
     for b in bookmakers:
         for mk in b.get("markets", []) or []:
             if mk.get("key") != "h2h":
@@ -273,27 +281,21 @@ def extract_candidates_from_match(m: dict, min_odds: float, max_odds: float) -> 
             avg_o, best_o = avg_best(h2h_prices.get(fav, []))
             if avg_o and best_o and min_odds <= best_o <= max_odds:
                 value = (best_o / avg_o) - 1.0 if avg_o else 0.0
-                out.append(
-                    {
-                        "match": f"{home} vs {away}",
-                        "home": home,
-                        "away": away,
-                        "league": None,
-                        "kickoff": kickoff,
-                        "bet_type": "H2H",
-                        "market_key": "h2h",
-                        "selection": fav,
-                        "line": None,
-                        "bookmaker": "best_of",
-                        "odds": best_o,
-                        "avg_odds": avg_o,
-                        "value_score": value,
-                        "data_quality": "LIVE",
-                    }
-                )
+                out.append({
+                    "match": f"{home} vs {away}",
+                    "home": home, "away": away,
+                    "league": None, "kickoff": kickoff,
+                    "bet_type": "H2H", "market_key": "h2h",
+                    "selection": fav, "line": None,
+                    "bookmaker": "best_of",
+                    "odds": float(best_o),
+                    "avg_odds": float(avg_o),
+                    "value_score": float(value),
+                    "data_quality": "LIVE",
+                })
 
-    # TOTALS
-    totals = {}
+    # ---- TOTALS: 2.5 / 3.5 / 1.5
+    totals: Dict[Tuple[float, str], List[float]] = {}
     for b in bookmakers:
         for mk in b.get("markets", []) or []:
             if mk.get("key") != "totals":
@@ -306,7 +308,7 @@ def extract_candidates_from_match(m: dict, min_odds: float, max_odds: float) -> 
                 pr = safe_float(o.get("price"))
                 if pt is None or pr is None:
                     continue
-                totals.setdefault((pt, nm), []).append(pr)
+                totals.setdefault((float(pt), nm), []).append(float(pr))
 
     for target_line in (2.5, 3.5, 1.5):
         hit_any = False
@@ -317,30 +319,24 @@ def extract_candidates_from_match(m: dict, min_odds: float, max_odds: float) -> 
             avg_o, best_o = avg_best(ps)
             if avg_o and best_o and min_odds <= best_o <= max_odds:
                 value = (best_o / avg_o) - 1.0 if avg_o else 0.0
-                out.append(
-                    {
-                        "match": f"{home} vs {away}",
-                        "home": home,
-                        "away": away,
-                        "league": None,
-                        "kickoff": kickoff,
-                        "bet_type": "TOTALS",
-                        "market_key": "totals",
-                        "selection": nm,
-                        "line": float(target_line),
-                        "bookmaker": "best_of",
-                        "odds": best_o,
-                        "avg_odds": avg_o,
-                        "value_score": value,
-                        "data_quality": "LIVE",
-                    }
-                )
+                out.append({
+                    "match": f"{home} vs {away}",
+                    "home": home, "away": away,
+                    "league": None, "kickoff": kickoff,
+                    "bet_type": "TOTALS", "market_key": "totals",
+                    "selection": nm, "line": float(target_line),
+                    "bookmaker": "best_of",
+                    "odds": float(best_o),
+                    "avg_odds": float(avg_o),
+                    "value_score": float(value),
+                    "data_quality": "LIVE",
+                })
                 hit_any = True
         if hit_any:
             break
 
-    # SPREADS
-    spreads = {}
+    # ---- SPREADS: -1/-0.5/+0.5/+1
+    spreads: Dict[Tuple[float, str], List[float]] = {}
     for b in bookmakers:
         for mk in b.get("markets", []) or []:
             if mk.get("key") != "spreads":
@@ -350,11 +346,10 @@ def extract_candidates_from_match(m: dict, min_odds: float, max_odds: float) -> 
                 pt = safe_float(o.get("point"))
                 pr = safe_float(o.get("price"))
                 if team_nm and pt is not None and pr is not None:
-                    spreads.setdefault((pt, team_nm), []).append(pr)
+                    spreads.setdefault((float(pt), team_nm), []).append(float(pr))
 
-    preferred_points = (-1.0, -0.5, 0.5, 1.0)
-    for p in preferred_points:
-        keys = [k for k in spreads.keys() if abs(k[0] - float(p)) < 1e-6]
+    for p in (-1.0, -0.5, 0.5, 1.0):
+        keys = [k for k in spreads.keys() if abs(k[0] - float(p)) < 1e-9]
         if not keys:
             continue
         for (pt, team_nm) in keys:
@@ -363,93 +358,53 @@ def extract_candidates_from_match(m: dict, min_odds: float, max_odds: float) -> 
             if avg_o and best_o and min_odds <= best_o <= max_odds:
                 sel = "HOME" if team_match_score(team_nm, home) >= team_match_score(team_nm, away) else "AWAY"
                 value = (best_o / avg_o) - 1.0 if avg_o else 0.0
-                out.append(
-                    {
-                        "match": f"{home} vs {away}",
-                        "home": home,
-                        "away": away,
-                        "league": None,
-                        "kickoff": kickoff,
-                        "bet_type": "SPREADS",
-                        "market_key": "spreads",
-                        "selection": sel,
-                        "line": float(p),
-                        "bookmaker": "best_of",
-                        "odds": best_o,
-                        "avg_odds": avg_o,
-                        "value_score": value,
-                        "data_quality": "LIVE",
-                    }
-                )
+                out.append({
+                    "match": f"{home} vs {away}",
+                    "home": home, "away": away,
+                    "league": None, "kickoff": kickoff,
+                    "bet_type": "SPREADS", "market_key": "spreads",
+                    "selection": sel, "line": float(p),
+                    "bookmaker": "best_of",
+                    "odds": float(best_o),
+                    "avg_odds": float(avg_o),
+                    "value_score": float(value),
+                    "data_quality": "LIVE",
+                })
         break
 
     return out
 
 
 # =========================================================
-#  DEMO jelöltek (UI-hoz, ha nincs adat)
+#  DEMO jelöltek – JAVÍTVA: külön meccsekből is ad 2.00 körüli ticketet
 # =========================================================
-def demo_candidates(now: datetime, leagues: list[str]) -> list[dict]:
-    # Direkt “életszerű”, de NEM valós meccsek.
-    # A cél: UI / kártyák / ticket logika látszódjon.
-    base = [
-        ("DEMO City", "Example United"),
-        ("Sample FC", "Mock Town"),
-        ("Alpha FC", "Beta FC"),
-        ("Northside", "Southside"),
+def demo_candidates(now: datetime, leagues: List[str]) -> List[Dict[str, Any]]:
+    # Biztos ticket: 1.42 * 1.41 = 2.0022 (tartományban)
+    demo = [
+        ("DEMO City", "Example United", "H2H", "DEMO City", None, 1.42),
+        ("Sample FC", "Mock Town", "TOTALS", "Over", 2.5, 1.41),
+        ("Alpha FC", "Beta FC", "SPREADS", "HOME", -0.5, 1.45),
+        ("Northside", "Southside", "TOTALS", "Under", 3.5, 1.44),
     ]
-    out = []
-    for i, (h, a) in enumerate(base):
-        kickoff = now + timedelta(hours=2 + i * 3)
-        lg = leagues[i % max(1, len(leagues))] if leagues else "soccer_epl"
 
-        # Keverünk piacokat, hogy mind látszódjon
+    out: List[Dict[str, Any]] = []
+    for i, (h, a, bt, sel, line, odds) in enumerate(demo):
+        kickoff = now + timedelta(hours=2 + i * 2)
+        lg = leagues[i % max(1, len(leagues))] if leagues else "soccer_epl"
+        avg_odds = odds * 0.985  # “átlag” csak UI-hoz
+        value_score = (odds / avg_odds) - 1.0
+
+        mk = "h2h" if bt == "H2H" else ("totals" if bt == "TOTALS" else "spreads")
         out.append({
             "match": f"{h} vs {a}",
-            "home": h,
-            "away": a,
-            "league": lg,
-            "kickoff": kickoff,
-            "bet_type": "H2H",
-            "market_key": "h2h",
-            "selection": h,
-            "line": None,
+            "home": h, "away": a,
+            "league": lg, "kickoff": kickoff,
+            "bet_type": bt, "market_key": mk,
+            "selection": sel, "line": line,
             "bookmaker": "DEMO",
-            "odds": 1.46,
-            "avg_odds": 1.43,
-            "value_score": (1.46/1.43)-1,
-            "data_quality": "DEMO (NEM AJÁNLOTT)",
-        })
-        out.append({
-            "match": f"{h} vs {a}",
-            "home": h,
-            "away": a,
-            "league": lg,
-            "kickoff": kickoff,
-            "bet_type": "TOTALS",
-            "market_key": "totals",
-            "selection": "Over",
-            "line": 2.5,
-            "bookmaker": "DEMO",
-            "odds": 1.54,
-            "avg_odds": 1.52,
-            "value_score": (1.54/1.52)-1,
-            "data_quality": "DEMO (NEM AJÁNLOTT)",
-        })
-        out.append({
-            "match": f"{h} vs {a}",
-            "home": h,
-            "away": a,
-            "league": lg,
-            "kickoff": kickoff,
-            "bet_type": "SPREADS",
-            "market_key": "spreads",
-            "selection": "HOME",
-            "line": -0.5,
-            "bookmaker": "DEMO",
-            "odds": 1.40,
-            "avg_odds": 1.38,
-            "value_score": (1.40/1.38)-1,
+            "odds": float(odds),
+            "avg_odds": float(avg_odds),
+            "value_score": float(value_score),
             "data_quality": "DEMO (NEM AJÁNLOTT)",
         })
     return out
@@ -458,25 +413,21 @@ def demo_candidates(now: datetime, leagues: list[str]) -> list[dict]:
 # =========================================================
 #  PONTOZÁS + INDOKLÁS
 # =========================================================
-def score_candidate(c: dict) -> tuple[float, str, dict]:
-    odds = safe_float(c.get("odds"), 0.0)
+def score_candidate(c: Dict[str, Any]) -> Tuple[float, str, Dict[str, Any]]:
+    odds = safe_float(c.get("odds"), 0.0) or 0.0
     avg_odds = safe_float(c.get("avg_odds"), odds) or odds
     value_score = safe_float(c.get("value_score"), 0.0) or 0.0
 
-    # odds closeness
     diff = abs(odds - TARGET_LEG_ODDS)
     odds_score = max(0.0, 30.0 * (1.0 - (diff / 0.6)))
-
-    # value bonus
     value_bonus = 20.0 * value_score
 
-    # DEMO esetén erős levonás (hogy ne “erős ajánlásnak” tűnjön)
     is_demo = str(c.get("data_quality", "")).startswith("DEMO")
     demo_pen = -25.0 if is_demo else 0.0
 
-    # weather/news (ha nincs kulcs: DEMO szöveg/0)
     city_guess = (c.get("home", "London").split()[-1] if c.get("home") else "London")
     w = get_weather_basic(city_guess)
+
     weather_pen = 0.0
     if w.get("wind") is not None and w["wind"] >= 12:
         weather_pen -= 6
@@ -484,17 +435,17 @@ def score_candidate(c: dict) -> tuple[float, str, dict]:
         weather_pen -= 4
 
     news_home = news_brief(c.get("home", ""))
-    time.sleep(0.10)
+    time.sleep(0.05)
     news_away = news_brief(c.get("away", ""))
 
     news_bias = 0
     if c.get("bet_type") == "H2H":
-        if team_match_score(c.get("selection", ""), c.get("home", "")) >= 0.7:
-            news_bias = news_home.get("score", 0)
+        if team_match_score(str(c.get("selection", "")), str(c.get("home", ""))) >= 0.7:
+            news_bias = int(news_home.get("score", 0))
         else:
-            news_bias = news_away.get("score", 0)
+            news_bias = int(news_away.get("score", 0))
     else:
-        news_bias = (news_home.get("score", 0) + news_away.get("score", 0))
+        news_bias = int(news_home.get("score", 0)) + int(news_away.get("score", 0))
 
     news_score = float(news_bias) * 6.0
 
@@ -512,32 +463,35 @@ def score_candidate(c: dict) -> tuple[float, str, dict]:
     else:
         bet_label = f"Piac: {bet_type}"
 
-    why = []
+    why: List[str] = []
     if is_demo:
-        why.append("⚠️ **DEMO mód:** nincs élő Odds API adat, ez UI/teszt jelölt, **nem ajánlott éles fogadásra**.")
+        why.append("⚠️ **DEMO mód:** nincs élő odds adat (kvóta/hiba), ez UI/teszt – **nem ajánlott éles fogadásra**.")
     why.append(f"Odds: **{odds:.2f}** (átlag: {avg_odds:.2f}, value: {value_score*100:.1f}%).")
+
     if news_bias > 0:
         why.append("Hírek összképe: **pozitív**.")
     elif news_bias < 0:
         why.append("Hírekben van **kockázati jel** (sérülés/hiányzás).")
     else:
         why.append("Hírek alapján nincs egyértelmű extra jel.")
+
     if w.get("temp") is not None:
-        why.append(f"Időjárás (város tipp): {w['temp']:.0f}°C, {w.get('desc','?')} (szél: {w.get('wind','?')} m/s).")
+        why.append(f"Időjárás: {w['temp']:.0f}°C, {w.get('desc','?')} (szél: {w.get('wind','?')} m/s).")
 
     reasoning = bet_label + "\n\n" + " ".join(why)
     meta = {"weather": w, "news_home": news_home, "news_away": news_away}
-    return final, reasoning, meta
+    return float(final), reasoning, meta
 
 
 # =========================================================
-#  DUÓ KIVÁLASZTÁS
+#  DUÓ KIVÁLASZTÁS – JAVÍTVA: ha nincs 2.00 körüli pár, akkor is ad 2 tippet
 # =========================================================
-def pick_best_duo(cands: list[dict]) -> tuple[list[dict], float]:
+def pick_best_duo(cands: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], float]:
     if len(cands) < 2:
         return [], 0.0
 
-    best_i, best_j = None, None
+    # 1) Próbáljuk: külön meccs + 2.00 tartomány
+    best_pair = None
     best_util = -1e18
     best_total = 0.0
 
@@ -545,32 +499,36 @@ def pick_best_duo(cands: list[dict]) -> tuple[list[dict], float]:
     for i in range(n):
         for j in range(i + 1, n):
             a, b = cands[i], cands[j]
+
             if a.get("match") == b.get("match"):
                 continue
+
             total_odds = float(a.get("odds", 0.0)) * float(b.get("odds", 0.0))
-            # DEMO esetén is próbáljuk 2.00 környékre hozni
             if not (TOTAL_ODDS_MIN <= total_odds <= TOTAL_ODDS_MAX):
                 continue
+
             closeness = 1.0 - min(1.0, abs(total_odds - TARGET_TOTAL_ODDS) / 0.15)
             util = float(a.get("score", 0.0)) + float(b.get("score", 0.0)) + 20.0 * closeness
+
             if util > best_util:
                 best_util = util
-                best_i, best_j = i, j
+                best_pair = (i, j)
                 best_total = total_odds
 
-    if best_i is None:
-        top2 = sorted(cands, key=lambda x: x.get("score", 0.0), reverse=True)[:2]
-        if len(top2) < 2:
-            return [], 0.0
-        return top2, float(top2[0]["odds"]) * float(top2[1]["odds"])
+    if best_pair is not None:
+        a, b = cands[best_pair[0]], cands[best_pair[1]]
+        return [a, b], float(best_total)
 
-    return [cands[best_i], cands[best_j]], best_total
+    # 2) Fallback: top2 score – akkor is, ha nem 2.00 körüli / akár ugyanaz a meccs
+    top2 = sorted(cands, key=lambda x: float(x.get("score", 0.0)), reverse=True)[:2]
+    total_odds = float(top2[0].get("odds", 0.0)) * float(top2[1].get("odds", 0.0))
+    return top2, float(total_odds)
 
 
 # =========================================================
 #  Mentés
 # =========================================================
-def save_ticket(ticket: list[dict]):
+def save_ticket(ticket: List[Dict[str, Any]]):
     if not ticket:
         return
     con = db()
@@ -610,40 +568,40 @@ def save_ticket(ticket: list[dict]):
 
 
 # =========================================================
-#  FŐ ELEMZÉS – ha nincs adat, DEMO ticketet ad
+#  FŐ ELEMZÉS – ha nincs LIVE adat (kvóta/401), DEMO-t ad, de ticket biztos lesz
 # =========================================================
-def run_analysis(leagues: list[str], window_hours: int, min_odds: float, max_odds: float, regions: str, debug: bool, force_demo_if_fail: bool) -> dict:
-    candidates = []
+def run_analysis(
+    leagues: List[str],
+    window_hours: int,
+    min_odds: float,
+    max_odds: float,
+    regions: str,
+    debug: bool,
+    force_demo_if_fail: bool
+) -> Dict[str, Any]:
+    candidates: List[Dict[str, Any]] = []
     now = now_utc()
     limit = now + timedelta(hours=int(window_hours))
 
-    debug_rows = []
-    hard_fail = False
-    fail_reason = ""
+    debug_rows: List[Tuple[str, str, int, str]] = []
+    any_live_ok = False
 
     for lg in leagues:
         try:
             data = odds_api_get(lg, REQUEST_MARKETS, regions=regions)
-            if not isinstance(data, list):
-                debug_rows.append((lg, "NEM LISTA válasz", 0, ""))
-                continue
+            any_live_ok = True
             debug_rows.append((lg, "OK", len(data), ""))
         except requests.exceptions.HTTPError as e:
-            # Itt látod a 401-et – és emiatt nincs event.
-            resp_txt = ""
-            code = getattr(e.response, "status_code", "")
+            code = getattr(getattr(e, "response", None), "status_code", "")
+            txt = ""
             try:
-                resp_txt = (e.response.text or "")[:300] if e.response is not None else str(e)[:300]
+                txt = (e.response.text or "")[:300] if getattr(e, "response", None) is not None else str(e)[:300]
             except Exception:
-                resp_txt = str(e)[:300]
-            debug_rows.append((lg, f"HTTPError {code}", 0, resp_txt))
-            hard_fail = True
-            fail_reason = f"Odds API HTTPError {code}"
+                txt = str(e)[:300]
+            debug_rows.append((lg, f"HTTPError {code}", 0, txt))
             continue
         except Exception as e:
             debug_rows.append((lg, "EXCEPTION", 0, str(e)[:300]))
-            hard_fail = True
-            fail_reason = "Odds API exception"
             continue
 
         for m in data:
@@ -662,21 +620,19 @@ def run_analysis(leagues: list[str], window_hours: int, min_odds: float, max_odd
                 c["meta"] = meta
                 candidates.append(c)
 
-            time.sleep(0.03)
+            time.sleep(0.02)
 
-    # Ha nincs jelölt / van 401: DEMO fallback
     used_demo = False
     if (not candidates) and force_demo_if_fail:
         used_demo = True
         candidates = demo_candidates(now, leagues)
-        # pontozzuk DEMO jelölteket is
         for c in candidates:
             sc, reason, meta = score_candidate(c)
             c["score"] = sc
             c["reasoning"] = reason
             c["meta"] = meta
 
-    candidates = sorted(candidates, key=lambda x: x.get("score", 0.0), reverse=True)
+    candidates = sorted(candidates, key=lambda x: float(x.get("score", 0.0)), reverse=True)
     ticket, total_odds = pick_best_duo(candidates)
 
     return {
@@ -684,9 +640,8 @@ def run_analysis(leagues: list[str], window_hours: int, min_odds: float, max_odd
         "ticket": ticket,
         "total_odds": total_odds,
         "debug_rows": debug_rows,
-        "hard_fail": hard_fail,
-        "fail_reason": fail_reason,
         "used_demo": used_demo,
+        "any_live_ok": any_live_ok,
     }
 
 
@@ -730,13 +685,12 @@ st.markdown(
 )
 
 st.markdown('<div class="hdr">⚽ TITAN – Strategic Intelligence</div>', unsafe_allow_html=True)
-st.caption("Manuális futtatás | meccsek X órán belül | 2 tipp ~2.00 össz-odds | h2h/totals/spreads | DEMO fallback ha nincs adat")
+st.caption("Manuális futtatás | X órán belüli meccsek | 2 tipp | ha nincs LIVE adat: DEMO ticket (nem ajánlott)")
 
 with st.sidebar:
     st.markdown("### ⚙️ Beállítások")
-
-    DEBUG = st.toggle("🔎 Debug mód (ligánkénti státusz + hiba)", value=True)
-    FORCE_DEMO = st.toggle("🧪 DEMO mód automatikusan, ha nincs adat/401", value=True)
+    DEBUG = st.toggle("🔎 Debug mód (ligánkénti státusz + hibák)", value=True)
+    FORCE_DEMO = st.toggle("🧪 DEMO ticket automatikusan (ha nincs LIVE adat)", value=True)
 
     leagues = st.multiselect("Ligák", DEFAULT_LEAGUES, default=DEFAULT_LEAGUES)
     window_hours = st.slider("Időablak (óra)", min_value=12, max_value=168, value=24, step=12)
@@ -759,7 +713,7 @@ if run_btn:
         st.session_state["last_run"] = res
 
         if res.get("used_demo"):
-            st.warning("⚠️ DEMO mód futott: nincs élő Odds API adat (pl. 401 / rossz kulcs / kvóta). Ezek **nem ajánlott** tippek, csak UI/teszt.")
+            st.warning("⚠️ DEMO ticket: nincs élő odds adat (kvóta/401/üres piac). UI/teszt – **nem ajánlott éles fogadásra**.")
 
         if DEBUG:
             with st.expander("🔎 Debug: Odds API státusz ligánként", expanded=True):
@@ -774,7 +728,7 @@ if st.session_state["last_run"] is not None:
     st.subheader("🎫 Ajánlott duplázó (2 tipp)")
 
     if not ticket:
-        st.warning("Nincs ticket (még DEMO-val sem). Próbáld lazítani a min/max oddsot, vagy kapcsold be a DEMO fallbacket.")
+        st.error("Nem sikerült ticketet generálni. (Ezt most már DEMO mellett sem kellene látnod.)")
     else:
         badge = "<span class='badge'>LIVE</span>"
         if res.get("used_demo"):
@@ -792,11 +746,18 @@ if st.session_state["last_run"] is not None:
             st.markdown("<div class='card'>", unsafe_allow_html=True)
             st.markdown(f"### #{idx}  {t['match']}")
             if kickoff_local:
-                st.markdown(f"<span class='muted'>Liga:</span> `{t['league']}`  |  <span class='muted'>Kezdés:</span> **{kickoff_local.strftime('%Y.%m.%d %H:%M')}**", unsafe_allow_html=True)
+                st.markdown(
+                    f"<span class='muted'>Liga:</span> `{t['league']}`  |  "
+                    f"<span class='muted'>Kezdés:</span> **{kickoff_local.strftime('%Y.%m.%d %H:%M')}**",
+                    unsafe_allow_html=True
+                )
             else:
                 st.markdown(f"<span class='muted'>Liga:</span> `{t['league']}`", unsafe_allow_html=True)
 
-            st.markdown(f"**Minőség:** `{t.get('data_quality','LIVE')}`  |  **Piac:** `{t['bet_type']}`  |  **Odds:** `{t['odds']:.2f}`  |  **Score:** `{t['score']:.0f}/100`")
+            st.markdown(
+                f"**Minőség:** `{t.get('data_quality','LIVE')}`  |  "
+                f"**Piac:** `{t['bet_type']}`  |  **Odds:** `{t['odds']:.2f}`  |  **Score:** `{t['score']:.0f}/100`"
+            )
 
             if t["bet_type"] == "H2H":
                 st.write(f"**Tipp:** {t['selection']} (rendes játékidő)")
