@@ -12,15 +12,24 @@ from math import sqrt
 #  KONFIG
 # =========================================================
 st.set_page_config(page_title="⚽ TITAN – Strategic Intelligence", layout="wide", page_icon="⚽")
+import os
 
-try:
-    ODDS_API_KEY = st.secrets["ODDS_API_KEY"]
-    WEATHER_KEY = st.secrets["WEATHER_API_KEY"]
-    NEWS_API_KEY = st.secrets["NEWS_API_KEY"]
-    FOOTBALL_DATA_KEY = st.secrets["FOOTBALL_DATA_KEY"]  # X-Auth-Token
-except Exception:
-    st.error("⚠️ Hiányzó kulcs(ok) a Streamlit Secrets-ben: ODDS_API_KEY, WEATHER_API_KEY, NEWS_API_KEY, FOOTBALL_DATA_KEY")
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")
+WEATHER_KEY = os.getenv("WEATHER_API_KEY")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+FOOTBALL_DATA_KEY = os.getenv("FOOTBALL_DATA_KEY")
+
+missing = []
+if not ODDS_API_KEY: missing.append("ODDS_API_KEY")
+if not WEATHER_KEY: missing.append("WEATHER_API_KEY")
+if not NEWS_API_KEY: missing.append("NEWS_API_KEY")
+if not FOOTBALL_DATA_KEY: missing.append("FOOTBALL_DATA_KEY")
+
+if missing:
+    st.error(f"⚠️ Hiányzó környezeti változók: {', '.join(missing)}")
     st.stop()
+
+
 
 DB_PATH = "titan.db"
 
