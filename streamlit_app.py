@@ -1,7 +1,6 @@
 import os
 import re
 import time
-import json
 import sqlite3
 from math import sqrt
 from difflib import SequenceMatcher
@@ -13,31 +12,29 @@ import streamlit as st
 
 
 # =========================================================
-#  TITAN – Strategic Intelligence (LIVE odds + fallback MODEL)
-#  - LIVE: TheOddsAPI (ha van kvóta/kulcs)
-#  - FALLBACK: football-data fixtures + egyszerű modell (nem bukméker odds!)
-#  - NINCS "kamu meccs": csak football-data vagy DB cache fixtures
+#  KONFIG
 # =========================================================
-
 st.set_page_config(page_title="⚽ TITAN – Strategic Intelligence", layout="wide", page_icon="⚽")
 
-ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-WEATHER_KEY = os.getenv("WEATHER_API_KEY")
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-FOOTBALL_DATA_KEY = os.getenv("FOOTBALL_DATA_KEY")
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
+WEATHER_KEY = os.getenv("WEATHER_API_KEY", "").strip()
+NEWS_API_KEY = os.getenv("NEWS_API_KEY", "").strip()
+FOOTBALL_DATA_KEY = os.getenv("FOOTBALL_DATA_KEY", "").strip()
 
 DB_PATH = "titan.db"
 
-# Ticket cél
+# Duplázó cél
 TARGET_TOTAL_ODDS = 2.00
 TOTAL_ODDS_MIN = 1.90
 TOTAL_ODDS_MAX = 2.10
-TARGET_LEG_ODDS = sqrt(2)  # ~1.414
 
-# Odds markets
+# Egy tippre “ideális” odds kb. sqrt(2) ≈ 1.414
+TARGET_LEG_ODDS = sqrt(2)
+
+# Odds API v4: dokumentált alappiacok
+# (totals/spreads nem mindig elérhető soccerre minden booknál)
 REQUEST_MARKETS = ["h2h", "totals", "spreads"]
 
-# Odds API ligák
 DEFAULT_LEAGUES = [
     "soccer_epl",
     "soccer_spain_la_liga",
@@ -47,18 +44,6 @@ DEFAULT_LEAGUES = [
     "soccer_uefa_champs_league",
     "soccer_uefa_europa_league",
 ]
-
-# Football-data versenyek (fallback fixtures / standings modellhez)
-# (Ezek stabil ID-k a football-data API-ban.)
-FD_COMPETITIONS = {
-    "soccer_epl": 2021,                 # Premier League
-    "soccer_spain_la_liga": 2014,       # La Liga
-    "soccer_germany_bundesliga": 2002,  # Bundesliga
-    "soccer_italy_serie_a": 2019,       # Serie A
-    "soccer_france_ligue_one": 2015,    # Ligue 1
-    "soccer_uefa_champs_league": 2001,  # UCL
-    "soccer_uefa_europa_league": 2146,  # UEL (football-data-nál változhat, de általában ez)
-}
 
 
 # =========================================================
@@ -77,7 +62,6 @@ def db():
 def init_db():
     con = db()
     cur = con.cursor()
-
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS predictions (
@@ -105,31 +89,13 @@ def init_db():
             home_goals INTEGER,
             away_goals INTEGER,
 
+            opening_odds REAL,
             closing_odds REAL,
             clv_percent REAL,
-
             data_quality TEXT
         )
         """
     )
-
-    # fixtures cache: valódi meccsek eltárolása UI-hoz akkor is, ha épp nincs API
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS fixtures_cache (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fetched_at TEXT,
-            league TEXT,
-            fd_match_id INTEGER,
-            kickoff_utc TEXT,
-            home TEXT,
-            away TEXT,
-            status TEXT,
-            payload_json TEXT
-        )
-        """
-    )
-
     con.commit()
     con.close()
 
@@ -171,7 +137,6 @@ def norm_team(s: str) -> str:
         "bayern munich": "bayern münchen",
         "internazionale": "inter",
         "psg": "paris saint germain",
-        "athletic bilbao": "athletic club",
     }
     return repl.get(s, s)
 
@@ -189,200 +154,246 @@ def team_match_score(a: str, b: str) -> float:
     return max(token_score, seq_score)
 
 
-def sigmoid(x: float) -> float:
-    # stabil
-    if x >= 0:
-        z = pow(2.718281828, -x)
-        return 1 / (1 + z)
-    z = pow(2.718281828, x)
-    return z / (1 + z)
+def fmt_dt_local(dt_utc: datetime):
+    if not dt_utc:
+        return "—"
+    try:
+        return dt_utc.astimezone().strftime("%Y.%m.%d %H:%M")
+    except Exception:
+        return dt_utc.strftime("%Y.%m.%d %H:%M")
 
 
 # =========================================================
-#  football-data.org (fixtures + standings modell)
+#  FOOTBALL-DATA.ORG (fixtures + settlement)
 # =========================================================
 def fd_headers():
     return {"X-Auth-Token": FOOTBALL_DATA_KEY} if FOOTBALL_DATA_KEY else {}
 
 
-@st.cache_data(ttl=900)
-def fd_get(url, params=None, timeout=20):
+@st.cache_data(ttl=300)
+def fd_get(url, params=None, timeout=15):
     if not FOOTBALL_DATA_KEY:
-        raise RuntimeError("Missing FOOTBALL_DATA_KEY")
+        return {"_error": "Nincs FOOTBALL_DATA_KEY"}
     r = requests.get(url, headers=fd_headers(), params=params, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
 
-def cache_fixtures(league_key: str, matches: list[dict]):
-    con = db()
-    cur = con.cursor()
-    fetched_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+@st.cache_data(ttl=300)
+def fd_fixtures_window(hours_ahead: int = 24):
+    """
+    Valós meccsek listája a football-data.org-ról (időablak: most -> +hours_ahead).
+    """
+    if not FOOTBALL_DATA_KEY:
+        return [], "Nincs FOOTBALL_DATA_KEY (football-data.org)."
 
-    for m in matches:
-        mid = (m.get("id") or None)
-        kickoff = (m.get("utcDate") or None)
-        home = ((m.get("homeTeam") or {}).get("name") or "")
-        away = ((m.get("awayTeam") or {}).get("name") or "")
-        status = (m.get("status") or "")
+    start = now_utc().date().isoformat()
+    end = (now_utc() + timedelta(hours=hours_ahead)).date().isoformat()
 
-        cur.execute(
-            """
-            INSERT INTO fixtures_cache (fetched_at, league, fd_match_id, kickoff_utc, home, away, status, payload_json)
-            VALUES (?,?,?,?,?,?,?,?)
-            """,
-            (
-                fetched_at,
-                league_key,
-                int(mid) if isinstance(mid, int) else None,
-                kickoff,
-                home,
-                away,
-                status,
-                json.dumps(m, ensure_ascii=False),
-            )
-        )
-    con.commit()
-    con.close()
+    try:
+        data = fd_get("https://api.football-data.org/v4/matches", params={"dateFrom": start, "dateTo": end})
+        matches = data.get("matches", []) or []
+        out = []
+        for m in matches:
+            utc = iso_to_dt(m.get("utcDate"))
+            if not utc:
+                continue
+            if not (now_utc() <= utc <= now_utc() + timedelta(hours=hours_ahead)):
+                continue
+
+            ht = (m.get("homeTeam") or {}).get("name")
+            at = (m.get("awayTeam") or {}).get("name")
+            comp = (m.get("competition") or {}).get("name")
+            comp_code = (m.get("competition") or {}).get("code")
+            mid = m.get("id")
+
+            if ht and at:
+                out.append(
+                    {
+                        "match_id": mid,
+                        "competition": comp or comp_code or "ismeretlen",
+                        "home": ht,
+                        "away": at,
+                        "kickoff_utc": utc,
+                        "status": m.get("status", ""),
+                    }
+                )
+        out.sort(key=lambda x: x["kickoff_utc"])
+        return out, ""
+    except Exception as e:
+        return [], f"football-data hiba: {e}"
 
 
-def load_cached_fixtures(leagues: list[str], date_from: str, date_to: str) -> list[dict]:
-    # fallback ha nincs FD kulcs / időszakos hiba: a DB-ből töltjük a legutóbbiakat
-    con = db()
-    q = """
-        SELECT payload_json
-        FROM fixtures_cache
-        WHERE league IN ({})
-          AND kickoff_utc >= ?
-          AND kickoff_utc <= ?
-        ORDER BY kickoff_utc ASC
-        LIMIT 300
-    """.format(",".join(["?"] * len(leagues)))
-    params = list(leagues) + [date_from, date_to]
-    df = pd.read_sql_query(q, con, params=params)
-    con.close()
-    out = []
-    for s in df["payload_json"].tolist():
+def fd_find_match_id(home: str, away: str, kickoff_utc: datetime):
+    """
+    Megpróbálja a football-data match ID-t megtalálni csapatnév + idő illesztéssel (±1 nap, ±8 óra).
+    """
+    if not FOOTBALL_DATA_KEY or not kickoff_utc:
+        return None
+
+    date_from = (kickoff_utc.date() - timedelta(days=1)).isoformat()
+    date_to = (kickoff_utc.date() + timedelta(days=1)).isoformat()
+
+    try:
+        data = fd_get("https://api.football-data.org/v4/matches", params={"dateFrom": date_from, "dateTo": date_to})
+        candidates = data.get("matches", []) or []
+    except Exception:
+        return None
+
+    best = (0.0, None)
+    for m in candidates:
         try:
-            out.append(json.loads(s))
+            fd_home = (m.get("homeTeam") or {}).get("name", "")
+            fd_away = (m.get("awayTeam") or {}).get("name", "")
+            fd_utc = iso_to_dt(m.get("utcDate"))
         except Exception:
-            pass
-    return out
-
-
-@st.cache_data(ttl=900)
-def fd_upcoming_matches_for_comp(comp_id: int, date_from: str, date_to: str) -> list[dict]:
-    url = f"https://api.football-data.org/v4/competitions/{comp_id}/matches"
-    js = fd_get(url, params={"dateFrom": date_from, "dateTo": date_to})
-    matches = js.get("matches", []) or []
-    # csak scheduled/timed
-    out = []
-    for m in matches:
-        stt = (m.get("status") or "")
-        if stt in ("SCHEDULED", "TIMED"):
-            out.append(m)
-    return out
-
-
-@st.cache_data(ttl=6 * 3600)
-def fd_strengths_for_comp(comp_id: int) -> dict:
-    """
-    Egyszerű, gyors "erő" modell standingsből.
-    Nem fogadásra "garancia", csak fallback minőség (MODEL).
-    """
-    url = f"https://api.football-data.org/v4/competitions/{comp_id}/standings"
-    js = fd_get(url)
-    standings = js.get("standings", []) or []
-    table = None
-    for s in standings:
-        if (s.get("type") or "") == "TOTAL":
-            table = s.get("table", [])
-            break
-    if not table:
-        # ha nincs TOTAL, vegyük az elsőt
-        table = (standings[0].get("table") if standings else []) or []
-
-    strengths = {}
-    for row in table:
-        team = ((row.get("team") or {}).get("name") or "")
-        played = safe_float(row.get("playedGames"), 0) or 0
-        points = safe_float(row.get("points"), 0) or 0
-        gd = safe_float(row.get("goalDifference"), 0) or 0
-
-        if played <= 0:
             continue
 
-        ppg = points / played
-        gdpg = gd / played
-        # egyszerű rating (skálázott): ppg dominál, gd finomít
-        rating = (ppg * 1.0) + (gdpg * 0.15)
-        strengths[norm_team(team)] = float(rating)
+        if not fd_home or not fd_away or not fd_utc:
+            continue
 
-    return strengths
+        if abs((fd_utc - kickoff_utc).total_seconds()) > 8 * 3600:
+            continue
+
+        s = (team_match_score(home, fd_home) + team_match_score(away, fd_away)) / 2.0
+        if s > best[0]:
+            best = (s, m.get("id"))
+
+    return best[1] if best[0] >= 0.60 else None
 
 
-def build_real_fixtures(leagues: list[str], window_hours: int, debug_rows: list) -> list[dict]:
-    """
-    Valódi upcoming meccsek:
-    - elsődlegesen football-data API-ból
-    - ha nincs kulcs / hiba: DB fixtures_cache-ből
-    """
-    now = now_utc()
-    end = now + timedelta(hours=int(window_hours))
-    date_from = now.date().isoformat()
-    date_to = end.date().isoformat()
+def fd_settle_prediction(pred_row: dict) -> dict:
+    match_id = pred_row.get("football_data_match_id")
+    if not match_id or not FOOTBALL_DATA_KEY:
+        return {"result": "UNKNOWN", "home_goals": None, "away_goals": None}
 
-    fixtures = []
-    used_cache = False
+    url = f"https://api.football-data.org/v4/matches/{match_id}"
+    try:
+        m = fd_get(url)
+    except Exception:
+        return {"result": "UNKNOWN", "home_goals": None, "away_goals": None}
 
-    if FOOTBALL_DATA_KEY:
-        for lg in leagues:
-            comp_id = FD_COMPETITIONS.get(lg)
-            if not comp_id:
-                debug_rows.append((lg, "FD: nincs comp mapping", 0, ""))
-                continue
-            try:
-                ms = fd_upcoming_matches_for_comp(comp_id, date_from, date_to)
-                debug_rows.append((lg, "FD: OK", len(ms), f"comp_id={comp_id}"))
-                # cacheljük DB-be (hogy később kulcs nélkül is legyen valós match UI-hoz)
-                try:
-                    cache_fixtures(lg, ms)
-                except Exception:
-                    pass
-                for m in ms:
-                    kickoff = iso_to_dt(m.get("utcDate"))
-                    if not kickoff:
-                        continue
-                    if now <= kickoff <= end:
-                        fixtures.append({"league": lg, "comp_id": comp_id, "fd": m})
-            except Exception as e:
-                debug_rows.append((lg, "FD: HIBA", 0, str(e)[:200]))
+    status = m.get("status", "")
+    if status not in ["FINISHED", "AWARDED"]:
+        return {"result": "PENDING", "home_goals": None, "away_goals": None}
+
+    score_ft = (m.get("score") or {}).get("fullTime", {}) or {}
+    hg = score_ft.get("home")
+    ag = score_ft.get("away")
+    if hg is None or ag is None:
+        return {"result": "UNKNOWN", "home_goals": None, "away_goals": None}
+
+    bet_type = pred_row.get("bet_type")
+    selection = pred_row.get("selection")
+    line = pred_row.get("line")
+
+    if bet_type == "H2H":
+        # Döntetlen = LOST (nem DNB)
+        if team_match_score(selection, pred_row.get("home", "")) >= 0.7:
+            res = "WON" if hg > ag else "LOST"
+        elif team_match_score(selection, pred_row.get("away", "")) >= 0.7:
+            res = "WON" if ag > hg else "LOST"
+        else:
+            res = "UNKNOWN"
+
+    elif bet_type == "TOTALS":
+        total = hg + ag
+        try:
+            ln = float(line)
+        except Exception:
+            return {"result": "UNKNOWN", "home_goals": int(hg), "away_goals": int(ag)}
+
+        # Push -> VOID (ha pontosan a line)
+        if abs(total - ln) < 1e-9:
+            res = "VOID"
+        else:
+            if str(selection).lower() == "over":
+                res = "WON" if total > ln else "LOST"
+            elif str(selection).lower() == "under":
+                res = "WON" if total < ln else "LOST"
+            else:
+                res = "UNKNOWN"
+
+    elif bet_type == "SPREADS":
+        try:
+            ln = float(line)
+        except Exception:
+            return {"result": "UNKNOWN", "home_goals": int(hg), "away_goals": int(ag)}
+
+        sel = str(selection).upper()
+        if sel == "HOME":
+            adj = (hg + ln) - ag
+        elif sel == "AWAY":
+            adj = (ag + ln) - hg
+        else:
+            adj = None
+
+        if adj is None:
+            res = "UNKNOWN"
+        else:
+            if adj > 0:
+                res = "WON"
+            elif adj < 0:
+                res = "LOST"
+            else:
+                res = "VOID"
     else:
-        debug_rows.append(("_GLOBAL_", "FD: nincs FOOTBALL_DATA_KEY", 0, ""))
+        res = "UNKNOWN"
 
-    if not fixtures:
-        # DB cache fallback
-        used_cache = True
-        cached = load_cached_fixtures(leagues, f"{date_from}T00:00:00Z", f"{date_to}T23:59:59Z")
-        for m in cached:
-            # próbáljuk league kulcsot a cache rekordból? payloadban nincs.
-            # Itt csak "valós meccs" kell UI-hoz: a league-t a kiválasztott ligák közül körbeosztjuk.
-            kickoff = iso_to_dt(m.get("utcDate"))
-            if not kickoff:
-                continue
-            if now <= kickoff <= end:
-                fixtures.append({"league": leagues[0] if leagues else "soccer_epl", "comp_id": None, "fd": m})
+    return {"result": res, "home_goals": int(hg), "away_goals": int(ag)}
 
-    return fixtures, used_cache
+
+def refresh_past_results():
+    con = db()
+    df = pd.read_sql_query("SELECT * FROM predictions WHERE result IN ('PENDING','UNKNOWN')", con)
+    con.close()
+    if df.empty:
+        return 0
+
+    updated = 0
+    now = now_utc()
+
+    for _, row in df.iterrows():
+        kickoff = iso_to_dt(row.get("kickoff_utc", ""))
+        if not kickoff:
+            continue
+        if now < kickoff + timedelta(hours=2):
+            continue
+
+        settle = fd_settle_prediction(row.to_dict())
+        if settle["result"] == "PENDING":
+            continue
+
+        con2 = db()
+        cur = con2.cursor()
+        cur.execute(
+            """
+            UPDATE predictions
+            SET result=?, settled_at=?, home_goals=?, away_goals=?
+            WHERE id=?
+            """,
+            (
+                settle["result"],
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                settle["home_goals"],
+                settle["away_goals"],
+                int(row["id"]),
+            ),
+        )
+        con2.commit()
+        con2.close()
+        updated += 1
+
+    return updated
 
 
 # =========================================================
-#  Weather + News (opcionális)
+#  KÜLSŐ ADAT – időjárás / hírek (opcionális)
 # =========================================================
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=600)
 def get_weather_basic(city_guess="London"):
     if not WEATHER_KEY:
-        return {"temp": None, "desc": "nincs adat", "wind": None}
+        return {"temp": None, "desc": "—", "wind": None}
     try:
         url = "https://api.openweathermap.org/data/2.5/weather"
         params = {"q": city_guess, "appid": WEATHER_KEY, "units": "metric", "lang": "hu"}
@@ -391,14 +402,14 @@ def get_weather_basic(city_guess="London"):
         data = r.json()
         return {
             "temp": safe_float((data.get("main") or {}).get("temp")),
-            "desc": ((data.get("weather") or [{}])[0] or {}).get("description", "ismeretlen"),
+            "desc": ((data.get("weather") or [{}])[0] or {}).get("description", "—"),
             "wind": safe_float((data.get("wind") or {}).get("speed")),
         }
     except Exception:
-        return {"temp": None, "desc": "ismeretlen", "wind": None}
+        return {"temp": None, "desc": "—", "wind": None}
 
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=600)
 def news_brief(team_name: str):
     if not NEWS_API_KEY:
         return {"score": 0, "lines": []}
@@ -431,12 +442,13 @@ def news_brief(team_name: str):
 
 
 # =========================================================
-#  Odds API (LIVE)
+#  ODDS API – biztonságos hívás + quota headerek
 # =========================================================
-@st.cache_data(ttl=180)
+@st.cache_data(ttl=120)
 def odds_api_get(league_key: str, markets: list[str], regions: str = "eu"):
     if not ODDS_API_KEY:
-        raise requests.exceptions.HTTPError("Missing ODDS_API_KEY")
+        return {"ok": False, "status": "Nincs ODDS_API_KEY", "events": [], "headers": {}}
+
     url = f"https://api.the-odds-api.com/v4/sports/{league_key}/odds"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -444,312 +456,216 @@ def odds_api_get(league_key: str, markets: list[str], regions: str = "eu"):
         "markets": ",".join(markets),
         "oddsFormat": "decimal",
     }
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        headers = {
+            "x-requests-remaining": r.headers.get("x-requests-remaining"),
+            "x-requests-used": r.headers.get("x-requests-used"),
+            "x-requests-last": r.headers.get("x-requests-last"),
+        }
+        if r.status_code != 200:
+            # 401 / quota / stb: NE dobjunk hibát, csak visszaadjuk
+            detail = ""
+            try:
+                detail = (r.text or "")[:500]
+            except Exception:
+                detail = ""
+            return {"ok": False, "status": f"HTTP {r.status_code}", "detail": detail, "events": [], "headers": headers}
+
+        js = r.json()
+        if not isinstance(js, list):
+            return {"ok": False, "status": "Nem lista válasz", "events": [], "headers": headers}
+        return {"ok": True, "status": "OK", "events": js, "headers": headers}
+    except Exception as e:
+        return {"ok": False, "status": f"Exception: {e}", "events": [], "headers": {}}
 
 
-def best_price_across_books(event: dict, market_key: str, selection_name: str, line: float | None = None):
+def extract_candidates_from_match(m: dict, min_odds: float, max_odds: float) -> list[dict]:
     """
-    Kiszedi a best price-t az összes bookmakerből egy adott selectionre.
-    Visszaad: best_odds, avg_odds
+    Valós odds jelöltek:
+    - H2H: favorit (alacsonyabb odds) *best price* (max) a bookok között
+    - TOTALS: 2.5/3.5/1.5 (Over/Under) *best price*
+    - SPREADS: -1/-0.5/0.5/1 (HOME/AWAY) *best price*
     """
-    prices = []
-    for b in event.get("bookmakers", []) or []:
-        for mk in b.get("markets", []) or []:
-            if mk.get("key") != market_key:
-                continue
-            for o in mk.get("outcomes", []) or []:
-                nm = (o.get("name") or "")
-                pt = safe_float(o.get("point"))
-                pr = safe_float(o.get("price"))
-                if pr is None:
+    out = []
+    home = m.get("home_team")
+    away = m.get("away_team")
+    kickoff = iso_to_dt(m.get("commence_time"))
+    if not home or not away or not kickoff:
+        return out
+
+    bookmakers = m.get("bookmakers", []) or []
+
+    def collect_prices(market_key: str):
+        prices = []
+        for b in bookmakers:
+            for mk in b.get("markets", []) or []:
+                if mk.get("key") != market_key:
                     continue
-                if market_key == "h2h":
-                    if team_match_score(nm, selection_name) >= 0.92:
-                        prices.append(pr)
-                elif market_key == "totals":
-                    if nm.lower() == selection_name.lower() and line is not None and pt is not None and abs(pt - float(line)) < 1e-6:
-                        prices.append(pr)
-                elif market_key == "spreads":
-                    if line is not None and pt is not None and abs(pt - float(line)) < 1e-6:
-                        # spreadsnél nm = team név
-                        if team_match_score(nm, selection_name) >= 0.92:
-                            prices.append(pr)
-    if not prices:
-        return None, None
-    avg_o = sum(prices) / len(prices)
-    best_o = max(prices)
-    return float(best_o), float(avg_o)
+                prices.append((b.get("key") or "book", mk.get("outcomes", []) or []))
+        return prices
 
+    # ---------- H2H ----------
+    h2h_blocks = collect_prices("h2h")
+    team_prices = {home: [], away: []}
+    draw_prices = []  # ha 3-way
+    for bk, outs in h2h_blocks:
+        for o in outs:
+            nm = o.get("name")
+            pr = safe_float(o.get("price"))
+            if pr is None:
+                continue
+            if nm == home:
+                team_prices[home].append(pr)
+            elif nm == away:
+                team_prices[away].append(pr)
+            elif str(nm).lower() == "draw":
+                draw_prices.append(pr)
 
-def find_matching_odds_event(events: list[dict], home: str, away: str):
-    """
-    Odds API event matching a football-data fixturehez (csapatnév fuzzy).
-    """
-    best = (0.0, None)
-    for ev in events:
-        h = ev.get("home_team") or ""
-        a = ev.get("away_team") or ""
-        sc = (team_match_score(home, h) + team_match_score(away, a)) / 2.0
-        if sc > best[0]:
-            best = (sc, ev)
-    return best[1] if best[0] >= 0.65 else None
+    if team_prices[home] and team_prices[away]:
+        # favorit: kisebb átlag odds
+        avg_home = sum(team_prices[home]) / len(team_prices[home])
+        avg_away = sum(team_prices[away]) / len(team_prices[away])
+        fav = home if avg_home < avg_away else away
 
+        best_odds = max(team_prices[fav])
+        avg_odds = (sum(team_prices[fav]) / len(team_prices[fav])) if team_prices[fav] else best_odds
 
-# =========================================================
-#  Candidate építés: LIVE vagy MODEL
-# =========================================================
-def model_candidates_from_fixture(league_key: str, comp_id: int | None, fd_match: dict, min_odds: float, max_odds: float):
-    """
-    Fallback MODEL jelöltek (nem bukméker odds):
-    - home win "fair" odds standings-alapú erőből
-    - over 1.5 / under 4.5 pseudo-odds várható gól alapján (egyszerű)
-    """
-    out = []
-    kickoff = iso_to_dt(fd_match.get("utcDate"))
-    home = ((fd_match.get("homeTeam") or {}).get("name") or "")
-    away = ((fd_match.get("awayTeam") or {}).get("name") or "")
-    mid = fd_match.get("id")
+        if min_odds <= best_odds <= max_odds:
+            out.append(
+                {
+                    "match": f"{home} vs {away}",
+                    "home": home,
+                    "away": away,
+                    "league": None,
+                    "kickoff": kickoff,
+                    "bet_type": "H2H",
+                    "market_key": "h2h",
+                    "selection": fav,
+                    "line": None,
+                    "bookmaker": "best_of",
+                    "odds": float(best_odds),
+                    "avg_odds": float(avg_odds),
+                    "data_quality": "LIVE",
+                }
+            )
 
-    if not kickoff or not home or not away:
-        return out
+    # ---------- TOTALS ----------
+    totals_blocks = collect_prices("totals")
+    totals_map = {}  # (point, name)-> list[price]
+    for bk, outs in totals_blocks:
+        for o in outs:
+            nm = (o.get("name") or "").strip().capitalize()  # Over/Under
+            pt = safe_float(o.get("point"))
+            pr = safe_float(o.get("price"))
+            if nm.lower() not in ("over", "under"):
+                continue
+            if pt is None or pr is None:
+                continue
+            totals_map.setdefault((float(pt), nm), []).append(pr)
 
-    strengths = {}
-    if FOOTBALL_DATA_KEY and comp_id:
-        try:
-            strengths = fd_strengths_for_comp(comp_id)
-        except Exception:
-            strengths = {}
-
-    sh = strengths.get(norm_team(home), 1.4)
-    sa = strengths.get(norm_team(away), 1.4)
-
-    # home win p
-    home_adv = 0.18
-    p_home = sigmoid((sh - sa) + home_adv)  # ~0.35-0.70 tipikusan
-    fair_home_odds = max(1.20, min(3.50, 1.0 / max(0.05, p_home)))
-
-    # expected goals (nagyon egyszerű: erők + baseline)
-    # több erő különbség -> több gól a favorittól
-    eg = 2.55 + (sh - sa) * 0.35
-    eg = max(1.6, min(3.6, eg))
-
-    # pseudo odds: minél magasabb eg, annál inkább over 1.5
-    # (nem tudományos, de UI-hoz és jelzéshez ok)
-    over15_odds = max(1.20, min(1.85, 1.85 - (eg - 2.0) * 0.35))
-    under45_odds = max(1.15, min(1.70, 1.45 + (eg - 2.5) * 0.10))
-
-    # szűrés
-    def add_if(ok_odds, bet_type, market_key, selection, line, note):
-        if ok_odds is None:
-            return
-        if not (min_odds <= ok_odds <= max_odds):
-            return
-        out.append({
-            "match": f"{home} vs {away}",
-            "home": home,
-            "away": away,
-            "league": league_key,
-            "kickoff": kickoff,
-            "bet_type": bet_type,
-            "market_key": market_key,
-            "selection": selection,
-            "line": line,
-            "bookmaker": "MODEL",
-            "odds": float(ok_odds),
-            "avg_odds": float(ok_odds),
-            "value_score": 0.0,
-            "data_quality": f"MODEL (NEM ODDS) – {note}",
-            "football_data_match_id": int(mid) if isinstance(mid, int) else None
-        })
-
-    add_if(fair_home_odds, "H2H", "h2h", home, None, "standings-alapú fair odds")
-    add_if(over15_odds, "TOTALS", "totals", "Over", 1.5, "egyszerű várható gól modell")
-    add_if(under45_odds, "TOTALS", "totals", "Under", 4.5, "egyszerű várható gól modell")
-
-    return out
-
-
-def live_candidates_from_odds(league_key: str, odds_events: list[dict], fd_match: dict, min_odds: float, max_odds: float):
-    """
-    LIVE jelöltek Odds API-ból a football-data fixturehez illesztve.
-    - H2H: favorit (legalacsonyabb best odds a két csapat között) -> valóságban inkább min avg, de itt ok
-    - Totals: 2.5 preferálva, majd 3.5, 1.5
-    - Spreads: -0.5 / +0.5 / -1 / +1
-    """
-    out = []
-    kickoff = iso_to_dt(fd_match.get("utcDate"))
-    home = ((fd_match.get("homeTeam") or {}).get("name") or "")
-    away = ((fd_match.get("awayTeam") or {}).get("name") or "")
-    mid = fd_match.get("id")
-
-    if not kickoff or not home or not away:
-        return out
-
-    ev = find_matching_odds_event(odds_events, home, away)
-    if not ev:
-        return out
-
-    # H2H: best price csapatra, és választjuk azt, ami "közelebb" van a target leg odds-hoz
-    bh, ah = best_price_across_books(ev, "h2h", home), best_price_across_books(ev, "h2h", away)
-    if bh[0] and ah[0]:
-        # válasszunk olyat, ami odds tartományban van és értelmes
-        candidates = [(home, bh[0], bh[1]), (away, ah[0], ah[1])]
-        candidates = [c for c in candidates if min_odds <= c[1] <= max_odds]
-        if candidates:
-            # prefer: closer to TARGET_LEG_ODDS
-            pick = min(candidates, key=lambda x: abs(x[1] - TARGET_LEG_ODDS))
-            sel, best_o, avg_o = pick
-            value = (best_o / avg_o) - 1.0 if (avg_o and avg_o > 0) else 0.0
-            out.append({
-                "match": f"{home} vs {away}",
-                "home": home,
-                "away": away,
-                "league": league_key,
-                "kickoff": kickoff,
-                "bet_type": "H2H",
-                "market_key": "h2h",
-                "selection": sel,
-                "line": None,
-                "bookmaker": "best_of",
-                "odds": float(best_o),
-                "avg_odds": float(avg_o) if avg_o else float(best_o),
-                "value_score": float(value),
-                "data_quality": "LIVE",
-                "football_data_match_id": int(mid) if isinstance(mid, int) else None
-            })
-
-    # Totals: preferált line-ok
-    for line in (2.5, 3.5, 1.5):
-        bo_over, ao_over = best_price_across_books(ev, "totals", "Over", line=line)
-        bo_under, ao_under = best_price_across_books(ev, "totals", "Under", line=line)
-        added_any = False
-        if bo_over and min_odds <= bo_over <= max_odds:
-            value = (bo_over / ao_over) - 1.0 if ao_over else 0.0
-            out.append({
-                "match": f"{home} vs {away}",
-                "home": home,
-                "away": away,
-                "league": league_key,
-                "kickoff": kickoff,
-                "bet_type": "TOTALS",
-                "market_key": "totals",
-                "selection": "Over",
-                "line": float(line),
-                "bookmaker": "best_of",
-                "odds": float(bo_over),
-                "avg_odds": float(ao_over) if ao_over else float(bo_over),
-                "value_score": float(value),
-                "data_quality": "LIVE",
-                "football_data_match_id": int(mid) if isinstance(mid, int) else None
-            })
-            added_any = True
-        if bo_under and min_odds <= bo_under <= max_odds:
-            value = (bo_under / ao_under) - 1.0 if ao_under else 0.0
-            out.append({
-                "match": f"{home} vs {away}",
-                "home": home,
-                "away": away,
-                "league": league_key,
-                "kickoff": kickoff,
-                "bet_type": "TOTALS",
-                "market_key": "totals",
-                "selection": "Under",
-                "line": float(line),
-                "bookmaker": "best_of",
-                "odds": float(bo_under),
-                "avg_odds": float(ao_under) if ao_under else float(bo_under),
-                "value_score": float(value),
-                "data_quality": "LIVE",
-                "football_data_match_id": int(mid) if isinstance(mid, int) else None
-            })
-            added_any = True
-        if added_any:
+    for target_line in (2.5, 3.5, 1.5):
+        found_any = False
+        for nm in ("Over", "Under"):
+            ps = totals_map.get((float(target_line), nm), [])
+            if not ps:
+                continue
+            best_odds = max(ps)
+            avg_odds = sum(ps) / len(ps)
+            if min_odds <= best_odds <= max_odds:
+                out.append(
+                    {
+                        "match": f"{home} vs {away}",
+                        "home": home,
+                        "away": away,
+                        "league": None,
+                        "kickoff": kickoff,
+                        "bet_type": "TOTALS",
+                        "market_key": "totals",
+                        "selection": nm,
+                        "line": float(target_line),
+                        "bookmaker": "best_of",
+                        "odds": float(best_odds),
+                        "avg_odds": float(avg_odds),
+                        "data_quality": "LIVE",
+                    }
+                )
+                found_any = True
+        if found_any:
             break
 
-    # Spreads: ha elérhető, próbáljuk -0.5 / +0.5 / -1 / +1
-    for hcap in (-0.5, 0.5, -1.0, 1.0):
-        # spreads marketben selection_name = team név
-        bo_h, ao_h = best_price_across_books(ev, "spreads", home, line=hcap)
-        bo_a, ao_a = best_price_across_books(ev, "spreads", away, line=hcap)
-        any_added = False
+    # ---------- SPREADS ----------
+    spreads_blocks = collect_prices("spreads")
+    spreads_map = {}  # (point, teamname)-> list[price]
+    for bk, outs in spreads_blocks:
+        for o in outs:
+            nm = o.get("name")
+            pt = safe_float(o.get("point"))
+            pr = safe_float(o.get("price"))
+            if not nm or pt is None or pr is None:
+                continue
+            spreads_map.setdefault((float(pt), nm), []).append(pr)
 
-        if bo_h and min_odds <= bo_h <= max_odds:
-            value = (bo_h / ao_h) - 1.0 if ao_h else 0.0
-            out.append({
-                "match": f"{home} vs {away}",
-                "home": home,
-                "away": away,
-                "league": league_key,
-                "kickoff": kickoff,
-                "bet_type": "SPREADS",
-                "market_key": "spreads",
-                "selection": "HOME",
-                "line": float(hcap),
-                "bookmaker": "best_of",
-                "odds": float(bo_h),
-                "avg_odds": float(ao_h) if ao_h else float(bo_h),
-                "value_score": float(value),
-                "data_quality": "LIVE",
-                "football_data_match_id": int(mid) if isinstance(mid, int) else None
-            })
-            any_added = True
-
-        if bo_a and min_odds <= bo_a <= max_odds:
-            value = (bo_a / ao_a) - 1.0 if ao_a else 0.0
-            out.append({
-                "match": f"{home} vs {away}",
-                "home": home,
-                "away": away,
-                "league": league_key,
-                "kickoff": kickoff,
-                "bet_type": "SPREADS",
-                "market_key": "spreads",
-                "selection": "AWAY",
-                "line": float(hcap),
-                "bookmaker": "best_of",
-                "odds": float(bo_a),
-                "avg_odds": float(ao_a) if ao_a else float(bo_a),
-                "value_score": float(value),
-                "data_quality": "LIVE",
-                "football_data_match_id": int(mid) if isinstance(mid, int) else None
-            })
-            any_added = True
-
-        if any_added:
-            break
+    preferred_points = (-1.0, -0.5, 0.5, 1.0)
+    for p in preferred_points:
+        keys = [k for k in spreads_map.keys() if abs(k[0] - float(p)) < 1e-9]
+        if not keys:
+            continue
+        for (pt, team_nm) in keys:
+            ps = spreads_map.get((pt, team_nm), [])
+            if not ps:
+                continue
+            best_odds = max(ps)
+            avg_odds = sum(ps) / len(ps)
+            if min_odds <= best_odds <= max_odds:
+                sel = "HOME" if team_match_score(team_nm, home) >= team_match_score(team_nm, away) else "AWAY"
+                out.append(
+                    {
+                        "match": f"{home} vs {away}",
+                        "home": home,
+                        "away": away,
+                        "league": None,
+                        "kickoff": kickoff,
+                        "bet_type": "SPREADS",
+                        "market_key": "spreads",
+                        "selection": sel,
+                        "line": float(p),
+                        "bookmaker": "best_of",
+                        "odds": float(best_odds),
+                        "avg_odds": float(avg_odds),
+                        "data_quality": "LIVE",
+                    }
+                )
+        break
 
     return out
 
 
 # =========================================================
-#  PONTOZÁS + INDOKLÁS
+#  PONTOZÁS (súlyozás) + magyar indoklás
 # =========================================================
 def score_candidate(c: dict) -> tuple[float, str, dict]:
     odds = safe_float(c.get("odds"), 0.0) or 0.0
     avg_odds = safe_float(c.get("avg_odds"), odds) or odds
-    value_score = safe_float(c.get("value_score"), 0.0) or 0.0
-    dq = str(c.get("data_quality", "LIVE"))
 
-    # odds closeness
+    # odds-komponens: közel a sqrt(2)-höz
     diff = abs(odds - TARGET_LEG_ODDS)
     odds_score = max(0.0, 30.0 * (1.0 - (diff / 0.6)))
 
-    # value bonus (LIVE-nál)
-    value_bonus = 20.0 * value_score if "LIVE" in dq else 0.0
+    # value (best vs avg): ha egyik book “jobb árat ad”
+    value_score = 0.0
+    if avg_odds > 0:
+        value_score = (odds / avg_odds) - 1.0
+    value_bonus = max(-10.0, min(10.0, 60.0 * value_score))  # korlát
 
-    # MODEL büntetés (nem bukméker)
-    model_pen = -18.0 if dq.startswith("MODEL") else 0.0
-
-    # weather/news
+    # időjárás / hírek (opcionális)
     city_guess = (c.get("home", "London").split()[-1] if c.get("home") else "London")
     w = get_weather_basic(city_guess)
     weather_pen = 0.0
     if w.get("wind") is not None and w["wind"] >= 12:
-        weather_pen -= 5
+        weather_pen -= 6
     if isinstance(w.get("desc"), str) and any(x in w["desc"].lower() for x in ["eső", "zápor", "vihar"]):
-        weather_pen -= 3
+        weather_pen -= 4
 
     news_home = news_brief(c.get("home", ""))
     time.sleep(0.05)
@@ -758,59 +674,54 @@ def score_candidate(c: dict) -> tuple[float, str, dict]:
     news_bias = 0
     if c.get("bet_type") == "H2H":
         if team_match_score(c.get("selection", ""), c.get("home", "")) >= 0.7:
-            news_bias = news_home.get("score", 0)
+            news_bias = int(news_home.get("score", 0))
         else:
-            news_bias = news_away.get("score", 0)
+            news_bias = int(news_away.get("score", 0))
     else:
-        news_bias = (news_home.get("score", 0) + news_away.get("score", 0))
+        news_bias = int(news_home.get("score", 0)) + int(news_away.get("score", 0))
 
     news_score = float(news_bias) * 6.0
 
-    raw = 52.0 + odds_score + value_bonus + news_score + weather_pen + model_pen
+    raw = 50.0 + odds_score + value_bonus + news_score + weather_pen
     final = max(0.0, min(100.0, raw))
 
-    # label
-    bet_type = c.get("bet_type")
-    if bet_type == "H2H":
-        bet_label = f"Végkimenetel: **{c.get('selection')}**"
-    elif bet_type == "TOTALS":
-        bet_label = f"Gólok száma: **{c.get('selection')} {c.get('line')}**"
-    elif bet_type == "SPREADS":
+    # Fogadás label
+    bt = c.get("bet_type")
+    if bt == "H2H":
+        bet_label = f"Végkimenetel (1X2/H2H): **{c.get('selection')}**"
+    elif bt == "TOTALS":
+        bet_label = f"Gólok száma (Over/Under): **{c.get('selection')} {c.get('line')}**"
+    elif bt == "SPREADS":
         side = "Hazai" if c.get("selection") == "HOME" else "Vendég"
         bet_label = f"Hendikep: **{side} {c.get('line')}**"
     else:
-        bet_label = f"Piac: {bet_type}"
+        bet_label = f"Piac: {bt}"
 
     why = []
-    if dq.startswith("MODEL"):
-        why.append("⚠️ **MODEL tipp (nem bukméker odds)** – akkor fut, ha nincs élő Odds API adat. Óvatosan kezeld.")
-    why.append(f"Odds: **{odds:.2f}** (átlag: {avg_odds:.2f}, value: {value_score*100:.1f}%).")
+    why.append(f"Odds: **{odds:.2f}** (piaci átlag ~{avg_odds:.2f}, value: {value_score*100:.1f}%).")
+    why.append(f"A cél a stabil duplázó: 2 tipp össz-odds ~{TARGET_TOTAL_ODDS:.2f}.")
     if news_bias > 0:
-        why.append("Hírek: inkább **pozitív**.")
+        why.append("Hírek összképe: **pozitív**.")
     elif news_bias < 0:
-        why.append("Hírek: van **kockázati jel** (sérülés/hiányzás).")
+        why.append("Hírekben van **kockázati jel** (hiányzó/sérülés gyanú).")
     else:
-        why.append("Hírek: nincs erős extra jel.")
+        why.append("Hírek alapján nincs erős extra jel.")
     if w.get("temp") is not None:
-        why.append(f"Időjárás: {w['temp']:.0f}°C, {w.get('desc','?')} (szél: {w.get('wind','?')} m/s).")
+        why.append(f"Időjárás (tipp): {w['temp']:.0f}°C, {w.get('desc','—')} (szél: {w.get('wind','?')} m/s).")
 
     reasoning = bet_label + "\n\n" + " ".join(why)
-    meta = {"weather": w, "news_home": news_home, "news_away": news_away}
+    meta = {"weather": w, "news_home": news_home, "news_away": news_away, "value_score": value_score}
     return final, reasoning, meta
 
 
 # =========================================================
-#  DUÓ KIVÁLASZTÁS
+#  DUÓ KIVÁLASZTÁS (2 tipp) – csak valós odds esetén
 # =========================================================
-def pick_best_duo(cands: list[dict]) -> tuple[list[dict], float, str]:
-    """
-    1) Első kör: total_odds a [min,max] sávban
-    2) Ha nincs: második kör: a két legjobb score külön meccsből (nem garantált 2.00)
-    """
+def pick_best_duo(cands: list[dict]) -> tuple[list[dict], float]:
     if len(cands) < 2:
-        return [], 0.0, "NINCS_ELEG"
+        return [], 0.0
 
-    best = (None, None, -1e18, 0.0)  # i, j, utility, total_odds
+    best = (None, None, -1e18, 0.0)
     n = len(cands)
 
     for i in range(n):
@@ -818,37 +729,29 @@ def pick_best_duo(cands: list[dict]) -> tuple[list[dict], float, str]:
             a, b = cands[i], cands[j]
             if a.get("match") == b.get("match"):
                 continue
+
             total_odds = float(a.get("odds", 0.0)) * float(b.get("odds", 0.0))
             if not (TOTAL_ODDS_MIN <= total_odds <= TOTAL_ODDS_MAX):
                 continue
+
             closeness = 1.0 - min(1.0, abs(total_odds - TARGET_TOTAL_ODDS) / 0.15)
-            utility = float(a.get("score", 0.0)) + float(b.get("score", 0.0)) + 22.0 * closeness
-            if utility > best[2]:
-                best = (i, j, utility, total_odds)
+            util = float(a.get("score", 0.0)) + float(b.get("score", 0.0)) + 20.0 * closeness
 
-    if best[0] is not None:
-        return [cands[best[0]], cands[best[1]]], best[3], "OK_2_00"
+            if util > best[2]:
+                best = (i, j, util, total_odds)
 
-    # fallback: top2 külön meccsből
-    sorted_c = sorted(cands, key=lambda x: x.get("score", 0.0), reverse=True)
-    pick = []
-    seen = set()
-    for c in sorted_c:
-        if c.get("match") in seen:
-            continue
-        pick.append(c)
-        seen.add(c.get("match"))
-        if len(pick) == 2:
-            break
-    if len(pick) < 2:
-        return [], 0.0, "NINCS_ELEG"
+    if best[0] is None:
+        # fallback: top2 score (ha nincs 2.00 körüli)
+        top2 = sorted(cands, key=lambda x: x.get("score", 0.0), reverse=True)[:2]
+        if len(top2) < 2:
+            return [], 0.0
+        return top2, float(top2[0]["odds"]) * float(top2[1]["odds"])
 
-    total_odds = float(pick[0].get("odds", 0.0)) * float(pick[1].get("odds", 0.0))
-    return pick, total_odds, "FALLBACK_TOP2"
+    return [cands[best[0]], cands[best[1]]], best[3]
 
 
 # =========================================================
-#  Mentés
+#  Mentés + CLV frissítés (csak ha Odds API él)
 # =========================================================
 def save_ticket(ticket: list[dict]):
     if not ticket:
@@ -861,8 +764,9 @@ def save_ticket(ticket: list[dict]):
             INSERT INTO predictions
             (created_at, match, home, away, league, kickoff_utc,
              bet_type, market_key, selection, line, bookmaker, odds,
-             score, reasoning, football_data_match_id, closing_odds, clv_percent, data_quality)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             score, reasoning, football_data_match_id,
+             opening_odds, closing_odds, clv_percent, data_quality)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -880,324 +784,496 @@ def save_ticket(ticket: list[dict]):
                 float(t.get("score", 0.0)),
                 t.get("reasoning"),
                 t.get("football_data_match_id"),
+                float(t.get("odds", 0.0)),  # opening = aktuális (fogadás előtti)
                 None,
                 None,
-                t.get("data_quality", "LIVE"),
+                "LIVE",
             ),
         )
     con.commit()
     con.close()
 
 
-# =========================================================
-#  RUN ANALYSIS
-# =========================================================
-def run_analysis(leagues: list[str], window_hours: int, min_odds: float, max_odds: float, regions: str, debug: bool):
-    candidates = []
-    debug_rows = []
+def update_clv_for_pending(regions: str, markets: list[str]):
+    """
+    CLV frissítés csak akkor, ha az Odds API él.
+    - Megkeresi a pending tippeket, amik 0-3 órán belül kezdődnek vagy már elkezdődtek.
+    - Újra lekéri az oddsot ugyanahhoz a ligához/meccshez és selectionhöz (best_of),
+      majd closing_odds és clv_percent frissítés.
+    """
+    if not ODDS_API_KEY:
+        return 0, "Nincs ODDS_API_KEY, CLV nem frissíthető."
 
-    # 1) valós fixtures (football-data vagy DB cache)
-    fixtures, used_cache = build_real_fixtures(leagues, window_hours, debug_rows)
+    con = db()
+    df = pd.read_sql_query(
+        """
+        SELECT id, league, match, home, away, kickoff_utc, bet_type, market_key, selection, line, opening_odds, closing_odds, clv_percent
+        FROM predictions
+        WHERE result='PENDING'
+        ORDER BY id DESC
+        LIMIT 300
+        """,
+        con,
+    )
+    con.close()
 
-    # 2) Odds API lekérés ligánként (ha tudjuk)
-    odds_by_league = {}
-    odds_ok = True
-    for lg in leagues:
-        try:
-            data = odds_api_get(lg, REQUEST_MARKETS, regions=regions)
-            if isinstance(data, list):
-                odds_by_league[lg] = data
-                debug_rows.append((lg, "ODDS: OK", len(data), ""))
+    if df.empty:
+        return 0, ""
+
+    now = now_utc()
+    targets = []
+    for _, r in df.iterrows():
+        ko = iso_to_dt(r.get("kickoff_utc", ""))
+        if not ko:
+            continue
+        # csak közel a kezdéshez (CLV)
+        if ko < now - timedelta(hours=3) or ko > now + timedelta(hours=3):
+            continue
+        targets.append(r.to_dict())
+
+    if not targets:
+        return 0, ""
+
+    updated = 0
+    # Ligánként egyszer kérünk, quota kímélés
+    by_league = {}
+    for t in targets:
+        lg = t.get("league") or ""
+        by_league.setdefault(lg, []).append(t)
+
+    for lg, rows in by_league.items():
+        if not lg:
+            continue
+        resp = odds_api_get(lg, markets, regions=regions)
+        if not resp.get("ok"):
+            return updated, f"CLV: Odds API nem elérhető ({resp.get('status')})."
+
+        events = resp.get("events", []) or []
+
+        # eseményből visszaépítjük a jelöltjeinket, és match+selection alapján megkeressük a best oddst
+        for row in rows:
+            home = row.get("home", "")
+            away = row.get("away", "")
+            bet_type = row.get("bet_type")
+            selection = row.get("selection")
+            line = row.get("line")
+            ko = iso_to_dt(row.get("kickoff_utc", ""))
+
+            best = None
+            for ev in events:
+                eh = ev.get("home_team")
+                ea = ev.get("away_team")
+                ek = iso_to_dt(ev.get("commence_time"))
+                if not eh or not ea or not ek or not ko:
+                    continue
+                # egyeztetés: csapatok + kickoff közelség
+                if abs((ek - ko).total_seconds()) > 3 * 3600:
+                    continue
+                if (team_match_score(eh, home) + team_match_score(ea, away)) / 2.0 < 0.75:
+                    continue
+
+                # ebből a meccsből jelöltek
+                cands = extract_candidates_from_match(ev, min_odds=1.01, max_odds=100.0)
+                # kiválasztjuk a megfelelőt
+                for c in cands:
+                    if c.get("bet_type") != bet_type:
+                        continue
+                    if bet_type == "H2H":
+                        if team_match_score(c.get("selection", ""), selection) < 0.9:
+                            continue
+                    elif bet_type == "TOTALS":
+                        if str(c.get("selection")).lower() != str(selection).lower():
+                            continue
+                        if abs(float(c.get("line", 0.0)) - float(line or 0.0)) > 1e-9:
+                            continue
+                    elif bet_type == "SPREADS":
+                        if str(c.get("selection")).upper() != str(selection).upper():
+                            continue
+                        if abs(float(c.get("line", 0.0)) - float(line or 0.0)) > 1e-9:
+                            continue
+
+                    cand_odds = safe_float(c.get("odds"))
+                    if cand_odds is None:
+                        continue
+                    if best is None or cand_odds > best:
+                        best = cand_odds
+
+            if best is None:
+                continue
+
+            opening = safe_float(row.get("opening_odds"))
+            if opening and best:
+                clv = ((opening - best) / opening) * 100.0  # ha closing kisebb -> jó CLV (pozitív)
             else:
-                odds_by_league[lg] = []
-                debug_rows.append((lg, "ODDS: NEM LISTA", 0, ""))
-        except Exception as e:
-            odds_ok = False
-            odds_by_league[lg] = []
-            debug_rows.append((lg, "ODDS: HIBA", 0, str(e)[:220]))
+                clv = None
 
-    # 3) jelöltek építése fixture-enként:
-    #    - ha van matching odds event: LIVE
-    #    - különben: MODEL
-    for fx in fixtures:
-        lg = fx["league"]
-        comp_id = fx.get("comp_id")
-        m = fx["fd"]
+            con2 = db()
+            cur2 = con2.cursor()
+            cur2.execute(
+                """
+                UPDATE predictions
+                SET closing_odds=?, clv_percent=?
+                WHERE id=?
+                """,
+                (float(best), (float(clv) if clv is not None else None), int(row["id"])),
+            )
+            con2.commit()
+            con2.close()
+            updated += 1
 
-        live_events = odds_by_league.get(lg, []) or []
-        live_c = []
-        if live_events:
-            live_c = live_candidates_from_odds(lg, live_events, m, min_odds, max_odds)
+    return updated, ""
 
-        if live_c:
-            candidates.extend(live_c)
-        else:
-            # fallback modell (valós meccsre)
-            model_c = model_candidates_from_fixture(lg, comp_id, m, min_odds, max_odds)
-            candidates.extend(model_c)
 
-        time.sleep(0.01)
+# =========================================================
+#  FŐ ELEMZÉS
+# =========================================================
+def run_analysis(leagues: list[str], window_hours: int, min_odds: float, max_odds: float, regions: str, debug: bool) -> dict:
+    updated_results = refresh_past_results()
 
-    # 4) pontozás
-    scored = []
-    for c in candidates:
-        sc, reason, meta = score_candidate(c)
-        c["score"] = sc
-        c["reasoning"] = reason
-        c["meta"] = meta
-        scored.append(c)
+    candidates = []
+    now = now_utc()
+    limit = now + timedelta(hours=int(window_hours))
 
-    scored = sorted(scored, key=lambda x: x.get("score", 0.0), reverse=True)
+    debug_rows = []
+    quota_info = {"remaining": None, "used": None, "last": None}
 
-    # 5) ticket
-    ticket, total_odds, ticket_mode = pick_best_duo(scored)
+    for lg in leagues:
+        resp = odds_api_get(lg, REQUEST_MARKETS, regions=regions)
+        headers = resp.get("headers", {}) or {}
+        if headers:
+            quota_info["remaining"] = headers.get("x-requests-remaining") or quota_info["remaining"]
+            quota_info["used"] = headers.get("x-requests-used") or quota_info["used"]
+            quota_info["last"] = headers.get("x-requests-last") or quota_info["last"]
 
-    # minőség flag
-    used_model = any(str(t.get("data_quality", "")).startswith("MODEL") for t in ticket) if ticket else False
+        if not resp.get("ok"):
+            if debug:
+                debug_rows.append(
+                    (
+                        lg,
+                        resp.get("status", "ERR"),
+                        0,
+                        (resp.get("detail", "") or "")[:220],
+                    )
+                )
+            continue
+
+        events = resp.get("events", []) or []
+        if debug:
+            debug_rows.append((lg, "OK", len(events), ""))
+
+        for m in events:
+            kickoff = iso_to_dt(m.get("commence_time"))
+            if not kickoff:
+                continue
+            if not (now <= kickoff <= limit):
+                continue
+
+            cands = extract_candidates_from_match(m, min_odds=min_odds, max_odds=max_odds)
+            for c in cands:
+                c["league"] = lg
+                sc, reason, meta = score_candidate(c)
+                c["score"] = sc
+                c["reasoning"] = reason
+                c["meta"] = meta
+
+                # football-data match id (settle-hez)
+                try:
+                    mid = fd_find_match_id(c["home"], c["away"], c["kickoff"])
+                except Exception:
+                    mid = None
+                c["football_data_match_id"] = mid
+
+                candidates.append(c)
+
+            time.sleep(0.02)
+
+    candidates = sorted(candidates, key=lambda x: x.get("score", 0.0), reverse=True)
+    ticket, total_odds = pick_best_duo(candidates)
 
     return {
-        "fixtures_count": len(fixtures),
-        "used_fixtures_cache": used_cache,
-        "odds_ok": odds_ok,
-        "candidates": scored,
+        "updated_results": updated_results,
+        "candidates": candidates,
         "ticket": ticket,
         "total_odds": total_odds,
-        "ticket_mode": ticket_mode,
-        "used_model": used_model,
         "debug_rows": debug_rows,
+        "quota_info": quota_info,
     }
 
 
 # =========================================================
-#  MODERN UI (tabs + compact cards)
+#  UI – Modern neon dashboard (Streamlit limitations mellett)
 # =========================================================
 st.markdown(
     """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@300;400;600&display=swap');
-html, body, [class*="css"]  { font-family: 'Inter', sans-serif; }
-.stApp { background: radial-gradient(1200px 600px at 20% 10%, rgba(0,212,255,0.10), transparent 60%),
-                  radial-gradient(1200px 600px at 80% 20%, rgba(255,0,110,0.10), transparent 60%),
-                  linear-gradient(135deg, #050716 0%, #0b1030 55%, #050716 100%); }
-
-.hdr {
-  font-family: 'Orbitron', sans-serif;
-  font-weight: 900;
-  font-size: 2.2rem;
-  margin: 0.1rem 0 0.25rem 0;
-  letter-spacing: 0.5px;
-  background: linear-gradient(90deg, #00d4ff, #7b2cbf, #ff006e);
-  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@300;400;600;700&display=swap');
+:root{
+  --bg1:#070a1a; --bg2:#0f1633;
+  --card: rgba(255,255,255,0.06);
+  --card2: rgba(255,255,255,0.04);
+  --border: rgba(255,255,255,0.12);
+  --text: rgba(255,255,255,0.92);
+  --muted: rgba(255,255,255,0.72);
+  --cyan:#00d4ff; --vio:#7b2cbf; --pink:#ff006e; --lime:#5CFF7A;
 }
-
-.subhdr { opacity: 0.85; margin-bottom: 0.8rem; }
-
-.kpi {
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; color: var(--text); }
+.stApp{
+  background:
+    radial-gradient(1200px 600px at 15% 10%, rgba(0,212,255,0.18), transparent 60%),
+    radial-gradient(900px 500px at 85% 20%, rgba(255,0,110,0.16), transparent 55%),
+    linear-gradient(135deg, var(--bg1) 0%, var(--bg2) 55%, var(--bg1) 100%);
+}
+.hdr{
+  font-family:'Orbitron', sans-serif;
+  letter-spacing: 0.5px;
+  font-weight: 900;
+  font-size: 2.35rem;
+  background: linear-gradient(90deg, var(--cyan), var(--vio), var(--pink));
+  -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+  margin: 0.2rem 0 0.2rem 0;
+}
+.subhdr{ color: var(--muted); margin-bottom: 0.8rem; }
+.panel{
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 16px 16px 10px 16px;
+  box-shadow: 0 18px 55px rgba(0,0,0,0.42);
+}
+.card{
+  background: var(--card2);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 16px;
+  margin: 10px 0;
+  box-shadow: 0 14px 45px rgba(0,0,0,0.40);
+}
+.badge{
+  display:inline-flex; align-items:center; gap:8px;
+  padding: 3px 10px; border-radius: 999px;
+  border: 1px solid rgba(0,212,255,0.35);
+  background: rgba(123,44,191,0.20);
+  color: rgba(255,255,255,0.90);
+  font-size: 0.86rem;
+}
+.badge2{
+  display:inline-flex; align-items:center; gap:8px;
+  padding: 3px 10px; border-radius: 999px;
+  border: 1px solid rgba(255,0,110,0.45);
+  background: rgba(255,0,110,0.14);
+  color: rgba(255,255,255,0.90);
+  font-size: 0.86rem;
+}
+.kpi{
   background: rgba(255,255,255,0.05);
   border: 1px solid rgba(255,255,255,0.10);
   border-radius: 16px;
   padding: 12px 14px;
-  box-shadow: 0 10px 30px rgba(0,0,0,0.25);
 }
-
-.card {
-  background: rgba(255,255,255,0.05);
-  border: 1px solid rgba(255,255,255,0.12);
-  border-radius: 18px;
-  padding: 14px 14px 12px 14px;
-  margin: 10px 0;
-  box-shadow: 0 10px 30px rgba(0,0,0,0.30);
-}
-
-.badge {
-  display:inline-block;
-  padding: 2px 10px;
-  border-radius: 999px;
-  border: 1px solid rgba(255,255,255,0.18);
-  background: rgba(255,255,255,0.06);
-  font-size: 0.78rem;
-  margin-left: 8px;
-}
-
-.badge_live { border-color: rgba(0,212,255,0.45); background: rgba(0,212,255,0.12); }
-.badge_model{ border-color: rgba(255,193,7,0.55); background: rgba(255,193,7,0.14); }
-.badge_warn { border-color: rgba(255,0,110,0.55); background: rgba(255,0,110,0.14); }
-
-.small { font-size: 0.90rem; opacity: 0.92; }
-.muted { opacity: 0.75; }
+.kpi .t{ color: var(--muted); font-size: 0.86rem; margin-bottom: 4px;}
+.kpi .v{ font-weight: 800; font-size: 1.25rem;}
+.small{ color: var(--muted); font-size: 0.9rem; }
+hr{ border: none; border-top: 1px solid rgba(255,255,255,0.10); margin: 1rem 0; }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
 st.markdown('<div class="hdr">⚽ TITAN – Strategic Intelligence</div>', unsafe_allow_html=True)
-st.markdown('<div class="subhdr">LIVE odds, ha van kvóta • ha nincs, valódi meccsekre MODEL fallback • nincs kamu mérkőzés</div>', unsafe_allow_html=True)
+st.markdown(
+    "<div class='subhdr'>Valós meccsek (football-data.org) + valós odds (The Odds API). Tipp <b>csak odds-szal</b>. Hibát nem dobunk: állapotot jelzünk.</div>",
+    unsafe_allow_html=True,
+)
 
 with st.sidebar:
     st.markdown("### ⚙️ Beállítások")
-    DEBUG = st.toggle("🔎 Debug (státuszok)", value=True)
+    DEBUG = st.toggle("🔎 Debug (státusz ligánként)", value=True)
 
-    leagues = st.multiselect("Ligák", DEFAULT_LEAGUES, default=DEFAULT_LEAGUES)
-    window_hours = st.slider("Időablak (óra)", 12, 168, 24, 12)
-
-    st.markdown("#### Odds szűrés")
+    leagues = st.multiselect("Ligák (Odds API kulcsok)", DEFAULT_LEAGUES, default=DEFAULT_LEAGUES)
+    window_hours = st.slider("Időablak (óra)", min_value=12, max_value=168, value=24, step=12)
     min_odds = st.number_input("Min odds / tipp", value=1.25, step=0.01, format="%.2f")
     max_odds = st.number_input("Max odds / tipp", value=1.95, step=0.01, format="%.2f")
     regions = st.selectbox("Odds API régió", options=["eu", "uk", "eu,uk"], index=0)
 
-    st.divider()
-    st.markdown("#### Kulcs státusz")
+    st.markdown("---")
+    st.markdown("### 🔑 Kulcs státusz (gyors)")
     st.write(f"ODDS_API_KEY: {'✅' if ODDS_API_KEY else '❌'}")
     st.write(f"FOOTBALL_DATA_KEY: {'✅' if FOOTBALL_DATA_KEY else '❌'}")
-    st.write(f"WEATHER_API_KEY: {'✅' if WEATHER_KEY else '❌'}")
-    st.write(f"NEWS_API_KEY: {'✅' if NEWS_API_KEY else '❌'}")
+    st.write(f"WEATHER_KEY: {'✅' if WEATHER_KEY else '—'}")
+    st.write(f"NEWS_API_KEY: {'✅' if NEWS_API_KEY else '—'}")
 
-
-c1, c2 = st.columns([1, 1])
-with c1:
+colA, colB, colC = st.columns([1, 1, 1])
+with colA:
     run_btn = st.button("🚀 Elemzés indítása", type="primary", use_container_width=True)
-with c2:
+with colB:
     save_btn = st.button("💾 Két tipp mentése DB-be", use_container_width=True)
+with colC:
+    clv_btn = st.button("📉 CLV frissítés (pending)", use_container_width=True)
 
 if "last_run" not in st.session_state:
     st.session_state["last_run"] = None
 
 if run_btn:
-    with st.spinner("Elemzés fut… (fixtures + odds/model + pontozás)"):
-        res = run_analysis(leagues, int(window_hours), float(min_odds), float(max_odds), regions, DEBUG)
+    with st.spinner("Futtatás: korábbi tippek settle + odds/score kalkuláció…"):
+        res = run_analysis(leagues, window_hours, float(min_odds), float(max_odds), regions, DEBUG)
         st.session_state["last_run"] = res
 
-tabs = st.tabs(["🎫 Ticket", "📌 Jelöltek", "📜 Előzmények", "🧪 Debug"])
-
-# ---------------- Ticket tab ----------------
-with tabs[0]:
-    res = st.session_state.get("last_run")
-    if not res:
-        st.info("Nyomd meg az **Elemzés indítása** gombot.")
-    else:
-        # KPI row
-        k1, k2, k3, k4 = st.columns(4)
-        with k1:
-            st.markdown(f"<div class='kpi'><div class='muted'>Valódi meccsek</div><div style='font-size:1.35rem;font-weight:700'>{res['fixtures_count']}</div></div>", unsafe_allow_html=True)
-        with k2:
-            st.markdown(f"<div class='kpi'><div class='muted'>Össz jelölt</div><div style='font-size:1.35rem;font-weight:700'>{len(res['candidates'])}</div></div>", unsafe_allow_html=True)
-        with k3:
-            st.markdown(f"<div class='kpi'><div class='muted'>Ticket mód</div><div style='font-size:1.10rem;font-weight:700'>{res['ticket_mode']}</div></div>", unsafe_allow_html=True)
-        with k4:
-            st.markdown(f"<div class='kpi'><div class='muted'>Össz-odds</div><div style='font-size:1.35rem;font-weight:700'>{res['total_odds']:.2f}</div></div>", unsafe_allow_html=True)
-
-        if res["used_fixtures_cache"]:
-            st.warning("⚠️ football-data nem volt elérhető: DB-ből töltöttem a legutóbbi **valódi** fixture cache-t (ha volt).")
-
-        if not res["odds_ok"]:
-            st.warning("⚠️ Odds API hiba/401/kvóta → LIVE odds helyett **MODEL** tippek futnak (valódi meccsekre).")
-
-        ticket = res["ticket"]
-        if not ticket:
-            st.error("Nincs ticket. (Valószínűleg nincs football-data fixture és cache sem.)")
+        if res.get("updated_results", 0) > 0:
+            st.success(f"✅ Korábbi tippek frissítve: {res['updated_results']} db lezárva.")
         else:
-            badge = "<span class='badge badge_live'>LIVE</span>"
-            if res["used_model"]:
-                badge = "<span class='badge badge_model'>MODEL (NEM ODDS)</span> <span class='badge badge_warn'>ÓVATOSAN</span>"
+            st.info("ℹ️ Korábbi tippeknél nincs frissítés (vagy még nem értek véget).")
 
-            st.markdown(f"### 🎫 Ajánlott duplázó {badge}", unsafe_allow_html=True)
+        qi = res.get("quota_info", {}) or {}
+        if qi.get("remaining") or qi.get("used"):
+            st.caption(
+                f"Odds API quota: remaining={qi.get('remaining','?')} | used={qi.get('used','?')} | last_cost={qi.get('last','?')}"
+            )
 
-            for idx, t in enumerate(ticket, start=1):
-                kickoff_local = t["kickoff"].astimezone() if t.get("kickoff") else None
-                meta = t.get("meta", {})
-                w = meta.get("weather", {})
-                nh = meta.get("news_home", {})
-                na = meta.get("news_away", {})
+        if DEBUG:
+            with st.expander("🔎 Debug: Odds API státusz ligánként", expanded=True):
+                dbg = pd.DataFrame(res.get("debug_rows", []), columns=["league", "status", "events", "details"])
+                st.dataframe(dbg, use_container_width=True)
 
-                st.markdown("<div class='card'>", unsafe_allow_html=True)
+# CLV gomb
+if clv_btn:
+    with st.spinner("CLV frissítés… (csak Odds API él esetén)"):
+        upd, msg = update_clv_for_pending(regions=regions, markets=REQUEST_MARKETS)
+        if msg:
+            st.warning(msg)
+        st.success(f"CLV frissítve: {upd} rekord.")
 
-                title = f"#{idx}  {t['match']}"
-                st.markdown(f"#### {title}")
+# Ticket megjelenítés
+if st.session_state["last_run"] is not None:
+    res = st.session_state["last_run"]
+    ticket = res.get("ticket", [])
+    total_odds = res.get("total_odds", 0.0)
 
-                sub = f"<span class='muted'>Liga:</span> <code>{t.get('league')}</code>"
-                if kickoff_local:
-                    sub += f" &nbsp;•&nbsp; <span class='muted'>Kezdés:</span> <b>{kickoff_local.strftime('%Y.%m.%d %H:%M')}</b>"
-                st.markdown(sub, unsafe_allow_html=True)
-
-                st.write(
-                    f"**Minőség:** `{t.get('data_quality','LIVE')}`  |  **Piac:** `{t['bet_type']}`  |  **Odds:** `{t['odds']:.2f}`  |  **Score:** `{t['score']:.0f}/100`"
-                )
-
-                if t["bet_type"] == "H2H":
-                    st.write(f"**Tipp:** {t['selection']} (rendes játékidő)")
-                elif t["bet_type"] == "TOTALS":
-                    st.write(f"**Tipp:** {t['selection']} {t['line']}")
-                elif t["bet_type"] == "SPREADS":
-                    side = "Hazai" if t["selection"] == "HOME" else "Vendég"
-                    st.write(f"**Tipp:** {side} {t['line']}")
-                else:
-                    st.write(f"**Tipp:** {t['selection']}")
-
-                st.markdown("**Miért:**")
-                st.write(t["reasoning"])
-
-                if w:
-                    st.caption(f"🌦️ Időjárás: {w.get('temp','?')}°C, {w.get('desc','?')}, szél: {w.get('wind','?')} m/s")
-
-                if (nh.get("lines") or na.get("lines")):
-                    with st.expander("📰 Friss hírcímek (forrással)", expanded=False):
-                        st.write(f"**{t['home']}**")
-                        for line in (nh.get("lines") or ["• nincs releváns friss cím"]):
-                            st.write(line)
-                        st.write(f"**{t['away']}**")
-                        for line in (na.get("lines") or ["• nincs releváns friss cím"]):
-                            st.write(line)
-
-                st.markdown("</div>", unsafe_allow_html=True)
-
-# ---------------- Candidates tab ----------------
-with tabs[1]:
-    res = st.session_state.get("last_run")
-    if not res:
-        st.info("Előbb futtasd az elemzést.")
+    st.markdown("<div class='panel'>", unsafe_allow_html=True)
+    st.subheader("🎫 Napi TOP 2 (súlyozás után)")
+    if not ticket:
+        st.warning(
+            "Nincs ajánlható TOP 2, mert **nincs elérhető odds** (pl. quota/401), vagy nincs a szűrőknek megfelelő piac.\n\n"
+            "➡️ A rendszer nem hibázik: **odds nélkül nem ad tippet** (ahogy kérted)."
+        )
     else:
-        dfc = pd.DataFrame(res["candidates"])
-        if dfc.empty:
-            st.warning("Nincs jelölt.")
-        else:
-            show_cols = ["league", "match", "kickoff", "bet_type", "selection", "line", "odds", "score", "data_quality"]
-            for c in show_cols:
-                if c not in dfc.columns:
-                    dfc[c] = None
-            dfc["kickoff"] = dfc["kickoff"].apply(lambda x: x.isoformat() if hasattr(x, "isoformat") else str(x))
-            st.dataframe(dfc[show_cols].head(250), use_container_width=True)
+        st.markdown(
+            f"**Össz-odds:** `{total_odds:.2f}`  "
+            f"<span class='badge'>cél: ~{TARGET_TOTAL_ODDS:.2f}</span>",
+            unsafe_allow_html=True,
+        )
 
-# ---------------- History tab ----------------
-with tabs[2]:
-    con = db()
-    df = pd.read_sql_query(
-        """
-        SELECT id, created_at, match, league, kickoff_utc,
-               bet_type, selection, line, odds,
-               score, result, data_quality
-        FROM predictions
-        ORDER BY id DESC
-        LIMIT 400
-        """,
-        con,
-    )
-    con.close()
-    st.dataframe(df, use_container_width=True)
+        for idx, t in enumerate(ticket, start=1):
+            meta = t.get("meta", {}) or {}
+            w = meta.get("weather", {}) or {}
+            nh = meta.get("news_home", {}) or {}
+            na = meta.get("news_away", {}) or {}
 
-# ---------------- Debug tab ----------------
-with tabs[3]:
-    res = st.session_state.get("last_run")
-    if not res:
-        st.info("Előbb futtasd az elemzést.")
-    else:
-        dbg = pd.DataFrame(res["debug_rows"], columns=["league", "status", "count", "details"])
-        st.dataframe(dbg, use_container_width=True)
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            st.markdown(f"### #{idx}  {t['match']}")
+            st.markdown(
+                f"<span class='small'>Liga:</span> <code>{t.get('league','—')}</code> "
+                f"| <span class='small'>Kezdés:</span> <b>{fmt_dt_local(t.get('kickoff'))}</b>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<span class='badge'>Piac: {t.get('bet_type')}</span> "
+                f"<span class='badge'>Odds: {float(t.get('odds',0.0)):.2f}</span> "
+                f"<span class='badge2'>Score: {float(t.get('score',0.0)):.0f}/100</span>",
+                unsafe_allow_html=True,
+            )
 
-# Save button action (global)
+            if t.get("bet_type") == "H2H":
+                st.write(f"**Tipp:** {t.get('selection')} (rendes játékidő)")
+            elif t.get("bet_type") == "TOTALS":
+                st.write(f"**Tipp:** {t.get('selection')} {t.get('line')}")
+            elif t.get("bet_type") == "SPREADS":
+                side = "Hazai" if t.get("selection") == "HOME" else "Vendég"
+                st.write(f"**Tipp:** {side} {t.get('line')}")
+            else:
+                st.write(f"**Tipp:** {t.get('selection')}")
+
+            st.markdown("**Miért ezt hozta ki a súlyozás:**")
+            st.write(t.get("reasoning", ""))
+
+            if w and (w.get("temp") is not None or w.get("desc")):
+                st.caption(f"🌦️ Időjárás: {w.get('temp','?')}°C, {w.get('desc','—')}, szél: {w.get('wind','?')} m/s")
+
+            if (nh.get("lines") or na.get("lines")):
+                with st.expander("📰 Friss hírcímek (forrással)", expanded=False):
+                    st.write(f"**{t.get('home','')}**")
+                    for line in (nh.get("lines") or []):
+                        st.write(line)
+                    st.write(f"**{t.get('away','')}**")
+                    for line in (na.get("lines") or []):
+                        st.write(line)
+
+            st.caption(f"football-data match_id: {t.get('football_data_match_id')}")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# Mentés
 if save_btn:
-    res = st.session_state.get("last_run")
-    if not res or not res.get("ticket"):
-        st.warning("Előbb futtasd az elemzést, hogy legyen ticket.")
+    if st.session_state["last_run"] is None or not st.session_state["last_run"].get("ticket"):
+        st.warning("Előbb futtasd az elemzést, hogy legyen TOP 2 (odds szükséges).")
     else:
-        save_ticket(res["ticket"])
-        st.success("✅ Ticket elmentve az adatbázisba.")
+        save_ticket(st.session_state["last_run"]["ticket"])
+        st.success("✅ A TOP 2 mentve az adatbázisba (opening_odds rögzítve).")
+
+st.markdown("---")
+
+# Valós meccsek panel (football-data) – mindig létező meccseket mutat
+st.subheader("📅 Valós meccsek az időablakban (football-data.org)")
+fixtures, fx_err = fd_fixtures_window(hours_ahead=int(window_hours))
+if fx_err:
+    st.warning(fx_err)
+elif not fixtures:
+    st.info("Nincs meccs a megadott időablakban a football-data szerint.")
+else:
+    fx_df = pd.DataFrame(
+        [
+            {
+                "Kezdés (helyi)": fmt_dt_local(x["kickoff_utc"]),
+                "Liga": x["competition"],
+                "Meccs": f"{x['home']} vs {x['away']}",
+                "Státusz": x["status"],
+                "match_id": x["match_id"],
+            }
+            for x in fixtures[:250]
+        ]
+    )
+    st.dataframe(fx_df, use_container_width=True)
+
+st.markdown("---")
+
+# Előzmények + stat
+st.subheader("📜 Előzmények + statisztika")
+con = db()
+df = pd.read_sql_query(
+    """
+    SELECT id, created_at, match, league, kickoff_utc,
+           bet_type, selection, line, odds, opening_odds, closing_odds, clv_percent,
+           score, result
+    FROM predictions
+    ORDER BY id DESC
+    LIMIT 400
+    """,
+    con,
+)
+con.close()
+
+st.dataframe(df, use_container_width=True)
+
+if not df.empty:
+    decided = df[df["result"].isin(["WON", "LOST"])]
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Összes tipp", len(df))
+    with c2:
+        st.metric("Lezárt tippek", len(decided))
+    with c3:
+        hit = (decided["result"].eq("WON").mean() * 100.0) if len(decided) else 0.0
+        st.metric("Találat % (W/L)", f"{hit:.0f}%")
+    with c4:
+        clv_mean = pd.to_numeric(df["clv_percent"], errors="coerce").dropna()
+        st.metric("Átlag CLV%", f"{clv_mean.mean():.2f}%" if not clv_mean.empty else "—")
