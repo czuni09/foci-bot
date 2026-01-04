@@ -2,3 +2,10 @@ streamlit
 requests
 pandas
 python-dotenv
+streamlit>=1.36
+pandas>=2.2
+requests>=2.32
+feedparser>=6.0.11
+aiohttp>=3.10
+understat>=0.1.6
+python-dateutil>=2.9
