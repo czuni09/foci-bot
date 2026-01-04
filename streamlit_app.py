@@ -1,23 +1,12 @@
 # ============================================================
 # TITAN – Advanced Football Betting Intelligence System
 # ============================================================
-# CÉL:
-# - Understat xG → Poisson → 1X2 / BTTS / O/U valószínűségek
-# - Odds API (best prices) + piaci value keresés
-# - GDELT & Google News RSS + automatikus magyar fordítás
-# - Időjárás (OpenWeather) + pszichológiai stressz modell
-# - Derby/rangadó automatikus kizárás
-# - Duplázó algoritmus: 2 tipp össz-odds ≈ 2.00
-# - SQLite backtest + CLV (closing line value) tracking
-# - Streamlit dashboard (TOP 2 pick + részletes elemzés)
-# ============================================================
 import os
 import re
 import math
 import time
 import sqlite3
 import asyncio
-import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -26,7 +15,6 @@ from typing import Dict, List, Tuple, Optional, Any
 
 import streamlit as st
 import pandas as pd
-import numpy as np
 import requests
 
 # =========================
@@ -34,31 +22,38 @@ import requests
 # =========================
 try:
     import aiohttp
+    AIOHTTP_AVAILABLE = True
 except ImportError:
+    AIOHTTP_AVAILABLE = False
     st.error("⚠️ **Hiányzó csomag: aiohttp**")
     st.code("pip install aiohttp", language="bash")
     st.stop()
 
 try:
     from understat import Understat
+    UNDERSTAT_AVAILABLE = True
 except ImportError:
+    UNDERSTAT_AVAILABLE = False
     st.error("⚠️ **Hiányzó csomag: understat**")
     st.code("pip install understat", language="bash")
     st.stop()
 
-# Opcionális importok (nem lép ki)
+# Opcionális importok
+FEEDPARSER_AVAILABLE = False
+PLOTLY_AVAILABLE = False
+
 try:
     import feedparser
-    FEED_OK = True
+    FEEDPARSER_AVAILABLE = True
 except ImportError:
-    FEED_OK = False
-    st.warning("`feedparser` nincs telepítve – Google RSS hírek nem érhetők el.")
+    # feedparser nincs telepítve, de a kód tovább fut
+    pass
 
 try:
     import plotly.express as px
-    PLOTLY_OK = True
+    PLOTLY_AVAILABLE = True
 except ImportError:
-    PLOTLY_OK = False
+    pass
 
 # =========================
 # STREAMLIT ALAPBEÁLLÍTÁS
@@ -81,7 +76,7 @@ ODDS_API_KEY = get_secret("ODDS_API_KEY")
 WEATHER_API_KEY = get_secret("WEATHER_API_KEY")
 NEWS_API_KEY = get_secret("NEWS_API_KEY")
 FOOTBALL_DATA_TOKEN = get_secret("FOOTBALL_DATA_TOKEN")
-MYMEMORY_EMAIL = get_secret("MYMEMORY_EMAIL")  # Opcionális, jobb rate limit-hez
+MYMEMORY_EMAIL = get_secret("MYMEMORY_EMAIL")  # Opcionális
 
 # =========================
 # GLOBÁLIS KONFIGURÁCIÓ
@@ -107,16 +102,16 @@ DAYS_AHEAD = 4
 MAX_GOALS = 10
 
 # Fogadási stratégia
-TARGET_TOTAL_ODDS = 2.00        # Duplázó cél
+TARGET_TOTAL_ODDS = 2.00
 TOTAL_ODDS_MIN = 1.85
 TOTAL_ODDS_MAX = 2.15
 TARGET_LEG_ODDS = math.sqrt(2)  # ≈1.414
 
 # Social & hírek
-USE_GOOGLE_NEWS = True
+USE_GOOGLE_NEWS = True if FEEDPARSER_AVAILABLE else False
 USE_GDELT = True
 TRANSLATE_TO_HU = True
-SOCIAL_MAX_ITEMS = 10
+SOCIAL_MAX_ITEMS = 8
 
 # Negatív trigger szavak
 NEGATIVE_KEYWORDS = [
@@ -267,8 +262,8 @@ def norm_team(s: str) -> str:
     repl = {
         "manchester utd": "manchester united",
         "man utd": "manchester united",
-        "bayern munchen": "bayern münchen",
-        "bayern munich": "bayern münchen",
+        "bayern munchen": "bayern munich",
+        "bayern munich": "bayern munich",
         "internazionale": "inter",
         "psg": "paris saint germain",
     }
@@ -411,82 +406,100 @@ def expected_goals_from_profiles(home: str, away: str, prof: dict, base=1.35):
     return lh, la, n_home, n_away
 
 # =========================
-# SOCIAL SIGNALS (GDELT + RSS + fordítás)
+# MAGYAR FORDÍTÁS
 # =========================
-def count_neg_hits(text: str) -> int:
-    t = (text or "").lower()
-    return sum(1 for k in NEGATIVE_KEYWORDS if k in t)
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def translate_en_to_hu(text: str) -> str:
     """Ingyenes magyar fordítás MyMemory API-val."""
     t = (text or "").strip()
-    if not t:
+    if not t or not TRANSLATE_TO_HU:
         return t
     try:
         url = "https://api.mymemory.translated.net/get"
         params = {"q": t, "langpair": "en|hu"}
         if MYMEMORY_EMAIL:
             params["de"] = MYMEMORY_EMAIL
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, timeout=8)
         r.raise_for_status()
         data = r.json()
         out = ((data.get("responseData") or {}).get("translatedText") or "").strip()
         return out if out else t
-    except Exception:
+    except Exception as e:
+        # Ha a fordítás nem sikerül, visszaadjuk az eredetit
         return t
 
-def google_news_rss(query: str, limit=10):
-    q = quote_plus(query)
-    url = f"https://news.google.com/rss/search?q={q}&hl=en&gl=US&ceid=US:en"
-    feed = feedparser.parse(url)
-    out = []
-    for e in (feed.entries or [])[:limit]:
-        title = e.get("title", "")
-        out.append({
-            "title": title,
-            "title_hu": translate_en_to_hu(title) if TRANSLATE_TO_HU else title,
-            "link": e.get("link", ""),
-            "published": e.get("published", ""),
-            "source": (e.get("source") or {}).get("title", ""),
-        })
-    return out
+# =========================
+# SOCIAL SIGNALS (GDELT + RSS)
+# =========================
+def count_neg_hits(text: str) -> int:
+    t = (text or "").lower()
+    return sum(1 for k in NEGATIVE_KEYWORDS if k in t)
 
-def gdelt_doc(query: str, maxrecords=10):
-    url = "https://api.gdeltproject.org/api/v2/doc/doc"
-    params = {
-        "query": query,
-        "mode": "ArtList",
-        "format": "json",
-        "maxrecords": maxrecords,
-        "sort": "HybridRel",
-    }
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    arts = data.get("articles", []) or []
-    out = []
-    for a in arts:
-        title = a.get("title", "")
-        out.append({
-            "title": title,
-            "title_hu": translate_en_to_hu(title) if TRANSLATE_TO_HU else title,
-            "url": a.get("url", ""),
-            "domain": a.get("domain", ""),
-            "seendate": a.get("seendate", ""),
-            "tone": a.get("tone", None),
-        })
-    return out
+def google_news_rss(query: str, limit=8):
+    """Google News RSS feed parser - csak akkor fut, ha a feedparser telepítve van."""
+    if not FEEDPARSER_AVAILABLE:
+        return []
+    
+    try:
+        q = quote_plus(query)
+        url = f"https://news.google.com/rss/search?q={q}&hl=en&gl=US&ceid=US:en"
+        feed = feedparser.parse(url)
+        out = []
+        for e in (feed.entries or [])[:limit]:
+            title = e.get("title", "")
+            out.append({
+                "title": title,
+                "title_hu": translate_en_to_hu(title),
+                "link": e.get("link", ""),
+                "published": e.get("published", ""),
+                "source": (e.get("source") or {}).get("title", ""),
+            })
+        return out
+    except Exception as e:
+        st.warning(f"Google RSS hiba: {e}")
+        return []
+
+def gdelt_doc(query: str, maxrecords=8):
+    """GDELT hírek keresése."""
+    try:
+        url = "https://api.gdeltproject.org/api/v2/doc/doc"
+        params = {
+            "query": query,
+            "mode": "ArtList",
+            "format": "json",
+            "maxrecords": maxrecords,
+            "sort": "HybridRel",
+        }
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        arts = data.get("articles", []) or []
+        out = []
+        for a in arts:
+            title = a.get("title", "")
+            out.append({
+                "title": title,
+                "title_hu": translate_en_to_hu(title),
+                "url": a.get("url", ""),
+                "domain": a.get("domain", ""),
+                "seendate": a.get("seendate", ""),
+                "tone": a.get("tone", None),
+            })
+        return out
+    except Exception as e:
+        st.warning(f"GDELT hiba: {e}")
+        return []
 
 def fetch_social_signals(home: str, away: str):
-    neg_terms = ["injury", "suspended", "scandal", "arrest", "divorce"]
-    gnews_q = f'({home} OR "{away}") AND ({" OR ".join(neg_terms)})'
-    gdelt_q = f'({home} OR "{away}") ({" OR ".join(neg_terms)})'
+    """Hírek gyűjtése mindkét csapatról."""
+    neg_terms = ["injury", "suspended", "scandal", "arrest", "divorce", "out", "doubt"]
+    gnews_q = f'("{home}" OR "{away}") AND ({" OR ".join(neg_terms)})'
+    gdelt_q = f'("{home}" OR "{away}") ({" OR ".join(neg_terms)})'
 
     social = {"gnews": [], "gdelt": [], "neg_hits": 0, "risk_penalty": 0.0}
 
     try:
-        if USE_GOOGLE_NEWS and FEED_OK:
+        if USE_GOOGLE_NEWS and FEEDPARSER_AVAILABLE:
             social["gnews"] = google_news_rss(gnews_q, SOCIAL_MAX_ITEMS)
             social["neg_hits"] += sum(count_neg_hits(x.get("title", "")) for x in social["gnews"])
 
@@ -530,7 +543,7 @@ def get_weather_basic(city_guess="London"):
             "units": "metric",
             "lang": "hu",
         }
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, timeout=8)
         r.raise_for_status()
         data = r.json()
         return {
@@ -557,7 +570,7 @@ def odds_api_get(league_key: str):
         "oddsFormat": "decimal",
     }
     try:
-        r = requests.get(url, params=params, timeout=20)
+        r = requests.get(url, params=params, timeout=15)
         if r.status_code != 200:
             return {"ok": False, "events": [], "msg": f"HTTP {r.status_code}"}
         return {"ok": True, "events": r.json(), "msg": "OK"}
@@ -632,7 +645,7 @@ def extract_best_odds(match_data: dict, home: str, away: str):
     return {"h2h": best_h2h, "totals": best_totals, "spreads": best_spreads}
 
 # =========================
-# FOOTBALL-DATA.ORG (eredmények)
+# FOOTBALL-DATA.ORG
 # =========================
 def fd_headers():
     return {"X-Auth-Token": FOOTBALL_DATA_TOKEN} if FOOTBALL_DATA_TOKEN else {}
@@ -646,7 +659,7 @@ def fd_find_match_id(home: str, away: str, kickoff_utc: datetime):
     try:
         url = "https://api.football-data.org/v4/matches"
         params = {"dateFrom": date_from, "dateTo": date_to}
-        r = requests.get(url, headers=fd_headers(), params=params, timeout=15)
+        r = requests.get(url, headers=fd_headers(), params=params, timeout=12)
         r.raise_for_status()
         candidates = r.json().get("matches", [])
     except Exception:
@@ -674,7 +687,7 @@ def fd_get_result(match_id: int):
         return None
     try:
         url = f"https://api.football-data.org/v4/matches/{match_id}"
-        r = requests.get(url, headers=fd_headers(), timeout=15)
+        r = requests.get(url, headers=fd_headers(), timeout=12)
         r.raise_for_status()
         m = r.json()
         status = m.get("status", "")
@@ -727,7 +740,6 @@ def score_bet_candidate(bet: dict, xg_home: float, xg_away: float, social: dict)
         else:
             xg_score = 0.0
     elif bet_type == "SPREADS":
-        # Spread esetén az xG különbség fontos
         xg_diff = xg_home - xg_away
         line = safe_float(bet.get("line"), 0.0)
         selection = bet.get("selection", "")
@@ -747,9 +759,9 @@ def score_bet_candidate(bet: dict, xg_home: float, xg_away: float, social: dict)
                 xg_score = -5.0
 
     # 3. Social penalty
-    social_pen = social["risk_penalty"] * 100  # % → pont
+    social_pen = social["risk_penalty"] * 100
 
-    # 4. Időjárás (csak akkor, ha erős szél vagy eső)
+    # 4. Időjárás
     weather = get_weather_basic(bet.get("home", "London").split()[-1])
     weather_pen = 0.0
     if weather.get("wind") is not None and weather["wind"] >= 12:
@@ -765,18 +777,22 @@ def score_bet_candidate(bet: dict, xg_home: float, xg_away: float, social: dict)
     why_parts = []
     why_parts.append(f"**Odds:** {odds:.2f} (cél: {TARGET_LEG_ODDS:.2f})")
     why_parts.append(f"**xG alap:** {xg_home:.2f} vs {xg_away:.2f} (össz: {total_xg:.2f})")
+    
     if xg_score > 15:
         why_parts.append("✅ **xG erősen támogatja** ezt a fogadást.")
     elif xg_score > 0:
         why_parts.append("⚖️ **xG enyhén támogatja**.")
     else:
         why_parts.append("⚠️ **xG nem támogatja** erősen.")
+    
     if social["neg_hits"] > 0:
         why_parts.append(f"⚠️ **Negatív hírek:** {social['neg_hits']} találat (-{social_pen:.0f} pont).")
     else:
         why_parts.append("✅ **Nincs negatív hír**.")
+    
     if weather.get("temp") is not None:
         why_parts.append(f"🌤️ **Időjárás:** {weather['temp']:.0f}°C, {weather.get('desc','—')} (szél: {weather.get('wind','?')} m/s).")
+    
     if weather_pen < 0:
         why_parts.append("🌪️ **Időjárás rizikó** (magas szél/eső).")
 
@@ -810,23 +826,25 @@ def pick_best_duo(candidates: list[dict]) -> Tuple[list[dict], float]:
     return [candidates[best[0]], candidates[best[1]]], best[3]
 
 # =========================
-# MAIN UI & LOGIC
+# MAIN UI
 # =========================
 st.title("⚽ TITAN – Strategic Intelligence")
-st.caption("Understat xG • Odds API • GDELT hírek • Időjárás • Magyar fordítás • Derby kizárás • Duplázó algoritmus")
+st.caption("Understat xG • Odds API • Hírek • Időjárás • Magyar fordítás • Derby kizárás • Duplázó algoritmus")
 
 # Status pill-ek
-status_cols = st.columns(5)
+status_cols = st.columns(6)
 with status_cols[0]:
-    st.markdown(f"**Understat** {'✅' if True else '❌'}")
+    st.markdown(f"**Understat** {'✅' if UNDERSTAT_AVAILABLE else '❌'}")
 with status_cols[1]:
     st.markdown(f"**Odds API** {'✅' if ODDS_API_KEY else '❌'}")
 with status_cols[2]:
-    st.markdown(f"**Hírek** {'✅' if (FEED_OK or USE_GDELT) else '❌'}")
+    st.markdown(f"**Hírek** {'✅' if (FEEDPARSER_AVAILABLE or USE_GDELT) else '❌'}")
 with status_cols[3]:
     st.markdown(f"**Időjárás** {'✅' if WEATHER_API_KEY else '❌'}")
 with status_cols[4]:
     st.markdown(f"**Fordítás** {'✅' if TRANSLATE_TO_HU else '❌'}")
+with status_cols[5]:
+    st.markdown(f"**Feedparser** {'✅' if FEEDPARSER_AVAILABLE else '❌'}")
 
 st.markdown("---")
 
@@ -983,7 +1001,8 @@ if run_analysis and selected_leagues:
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.metric("Típus", f"{pick['bet_type']}")
-                    st.metric("Választás", f"{pick['selection']} {pick['line'] if pick['line'] else ''}")
+                    line_display = pick['line'] if pick['line'] is not None else "-"
+                    st.metric("Választás", f"{pick['selection']} {line_display}")
                 with col2:
                     st.metric("Odds", f"{pick['odds']:.2f}")
                     st.metric("Pontszám", f"{pick['score']:.1f}/100")
@@ -1001,12 +1020,15 @@ if run_analysis and selected_leagues:
                 if social.get("gnews") or social.get("gdelt"):
                     news_display = []
                     for item in social.get("gnews", [])[:3]:
-                        title = item.get("title_hu") if TRANSLATE_TO_HU else item.get("title")
-                        news_display.append(f"• **{title}** (Google News)")
+                        title_hu = item.get("title_hu", item.get("title", "Nincs cím"))
+                        news_display.append(f"• **{title_hu}** (Google News)")
                     for item in social.get("gdelt", [])[:2]:
-                        title = item.get("title_hu") if TRANSLATE_TO_HU else item.get("title")
-                        news_display.append(f"• **{title}** (GDELT)")
-                    st.markdown("\n".join(news_display))
+                        title_hu = item.get("title_hu", item.get("title", "Nincs cím"))
+                        news_display.append(f"• **{title_hu}** (GDELT)")
+                    if news_display:
+                        st.markdown("\n".join(news_display))
+                    else:
+                        st.info("Nincs releváns hír.")
                 else:
                     st.info("Nincs releváns hír.")
 
@@ -1015,7 +1037,12 @@ if run_analysis and selected_leagues:
                 weather = get_weather_basic(city_guess)
                 if weather["temp"] is not None:
                     st.markdown(f"#### 🌤️ Időjárás ({city_guess})")
-                    st.markdown(f"{weather['temp']:.0f}°C, {weather['desc']}, szél: {weather.get('wind', '?')} m/s")
+                    desc = weather['desc']
+                    if TRANSLATE_TO_HU and desc != "—":
+                        # Ha nincs lefordítva, fordítjuk
+                        if not any(c in desc for c in 'áéíóöőúüű'):
+                            desc = translate_en_to_hu(desc)
+                    st.markdown(f"**{weather['temp']:.0f}°C**, {desc}, szél: {weather.get('wind', '?')} m/s")
 
                 # Mentés gomb
                 if st.button(f"💾 Mentés (pick {idx+1})", key=f"save_{idx}"):
@@ -1057,7 +1084,7 @@ if run_analysis and selected_leagues:
         st.markdown("---")
         st.subheader("📈 Backtest / Előzmények")
         con = get_db()
-        df_history = pd.read_sql_query("SELECT * FROM predictions ORDER BY id DESC LIMIT 20", con)
+        df_history = pd.read_sql_query("SELECT * FROM predictions ORDER BY id DESC LIMIT 15", con)
         con.close()
         if not df_history.empty:
             df_display = df_history[["created_at", "match", "bet_type", "selection", "odds", "score", "result"]].copy()
@@ -1079,7 +1106,7 @@ else:
 # =========================
 st.markdown("---")
 st.caption(
-    "TITAN v2 • Understat xG • Odds API • GDELT • Google News RSS • OpenWeather • "
-    "MyMemory fordítás • Derby kizárás • Duplázó algoritmus • "
+    f"TITAN v2 • Understat xG • Odds API • {'GDELT + RSS' if FEEDPARSER_AVAILABLE else 'GDELT'} • OpenWeather • "
+    f"MyMemory fordítás • Derby kizárás • Duplázó algoritmus • "
     f"Frissítve: {datetime.now().astimezone().strftime('%Y.%m.%d %H:%M')}"
 )
