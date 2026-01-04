@@ -17,3 +17,6 @@ pytz==2023.3
 # Optional / Likely Needed
 openai==1.6.1       # Ha az OpenAI API-t használod a kódban
 cachetools==5.3.2   # Gyorsítótárazáshoz
+numpy	numpy==1.26.2
+pandas	pandas==2.1.4
+pytz	pytz==2023.3
