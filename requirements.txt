@@ -1,16 +1,6 @@
-# Alapvető keretrendszer és adatkezelés
-streamlit>=1.36.0
-pandas>=2.2.0
-python-dotenv>=1.0.1
-
-# Hálózati kommunikáció (Aszinkron fókusz)
-aiohttp>=3.10.0
-requests>=2.32.0
-feedparser>=6.0.11
-
-# Futball specifikus adatok és időkezelés
-understat>=0.1.6
-python-dateutil>=2.9.0
-
-# Opcionális (ha később grafikonokat is szeretnél)
-plotly>=5.22.0
+aiohttp
+understat
+streamlit
+pandas
+requests
+feedpars
