@@ -6,10 +6,13 @@ dotenv==1.0.0
 # HTTP & API Communication
 requests==2.31.0
 feedparser==6.0.11
+aiohttp==3.9.3
+httpx==0.26.0
 
 # Data Manipulation & Analysis (CRITICAL FOR YOUR BOT)
 numpy==1.26.2
 pandas==2.1.4
+scipy==1.11.4   # Poisson-eloszláshoz lehet szükség
 
 # Date & Time Handling
 python-dateutil==2.8.2
