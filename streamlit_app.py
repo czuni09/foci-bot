@@ -33,15 +33,11 @@ except ImportError:
     st.code("pip install understat", language="bash")
     st.stop()
 
-# Feedparser - TELEPÍTETLEN KORLÁTOZÁS
-FEEDPARSER_AVAILABLE = False
-# Feedparser NEM kerül importálásra - helyette alternatív megoldás
-
 # =========================
 # STREAMLIT ALAPBEÁLLÍTÁS
 # =========================
 st.set_page_config(
-    page_title="⚽ Football Intelligence System",
+    page_title="⚽ Football Oracle",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -85,8 +81,7 @@ TOTAL_ODDS_MIN = 1.85
 TOTAL_ODDS_MAX = 2.15
 TARGET_LEG_ODDS = math.sqrt(2)
 
-# Social & hírek - feedparser nélkül
-USE_GOOGLE_NEWS = False  # Google RSS nem működik feedparser nélkül
+USE_NEWS_API = True if NEWS_API_KEY else False
 USE_GDELT = True
 TRANSLATE_TO_HU = True
 SOCIAL_MAX_ITEMS = 8
@@ -392,43 +387,43 @@ def translate_en_to_hu(text: str) -> str:
         return t
 
 # =========================
-# SOCIAL SIGNALS - FEEDPARSER NÉLKÜL
+# SOCIAL SIGNALS
 # =========================
 def count_neg_hits(text: str) -> int:
     t = (text or "").lower()
     return sum(1 for k in NEGATIVE_KEYWORDS if k in t)
 
-def google_news_api_fallback(query: str, limit=8):
-    """Google News alternatíva RSS helyett - NewsAPI vagy GDELT"""
-    # NewsAPI-t használunk ha van kulcs, különben csak GDELT
-    if NEWS_API_KEY:
-        try:
-            url = "https://newsapi.org/v2/everything"
-            params = {
-                "q": query,
-                "language": "en",
-                "sortBy": "publishedAt",
-                "pageSize": limit,
-                "apiKey": NEWS_API_KEY
-            }
-            r = requests.get(url, params=params, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                articles = data.get("articles", [])
-                out = []
-                for a in articles:
-                    title = a.get("title", "")
-                    out.append({
-                        "title": title,
-                        "title_hu": translate_en_to_hu(title),
-                        "link": a.get("url", ""),
-                        "published": a.get("publishedAt", ""),
-                        "source": a.get("source", {}).get("name", ""),
-                    })
-                return out
-        except Exception:
-            pass
-    return []  # Ha nincs API kulcs vagy hiba
+def fetch_news_api(query: str, limit=8):
+    """NewsAPI hírek"""
+    if not NEWS_API_KEY:
+        return []
+    try:
+        url = "https://newsapi.org/v2/everything"
+        params = {
+            "q": query,
+            "language": "en",
+            "sortBy": "publishedAt",
+            "pageSize": limit,
+            "apiKey": NEWS_API_KEY
+        }
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            articles = data.get("articles", [])
+            out = []
+            for a in articles:
+                title = a.get("title", "")
+                out.append({
+                    "title": title,
+                    "title_hu": translate_en_to_hu(title),
+                    "link": a.get("url", ""),
+                    "published": a.get("publishedAt", ""),
+                    "source": a.get("source", {}).get("name", ""),
+                })
+            return out
+    except Exception:
+        pass
+    return []
 
 def gdelt_doc(query: str, maxrecords=8):
     try:
@@ -467,9 +462,8 @@ def fetch_social_signals(home: str, away: str):
     social = {"news": [], "gdelt": [], "neg_hits": 0, "risk_penalty": 0.0}
 
     try:
-        if USE_GOOGLE_NEWS:
-            # Csak NewsAPI-t használunk
-            social["news"] = google_news_api_fallback(news_q, SOCIAL_MAX_ITEMS)
+        if USE_NEWS_API:
+            social["news"] = fetch_news_api(news_q, SOCIAL_MAX_ITEMS)
             social["neg_hits"] += sum(count_neg_hits(x.get("title", "")) for x in social["news"])
 
         if USE_GDELT:
@@ -785,7 +779,7 @@ def pick_best_duo(candidates: list):
 # =========================
 # MAIN UI
 # =========================
-st.title("⚽ Football Intelligence System")
+st.title("⚽ Football Oracle")
 st.caption("Understat xG • Odds API • Hírek • Időjárás • Magyar fordítás • Derby kizárás • Duplázó algoritmus")
 
 status_cols = st.columns(6)
@@ -800,7 +794,7 @@ with status_cols[3]:
 with status_cols[4]:
     st.markdown(f"**Fordítás** {'✅' if TRANSLATE_TO_HU else '❌'}")
 with status_cols[5]:
-    st.markdown(f"**Feedparser** {'❌' if not FEEDPARSER_AVAILABLE else '✅'}")
+    st.markdown(f"**SQLite DB** ✅")
 
 st.markdown("---")
 
@@ -1039,7 +1033,7 @@ else:
 
 st.markdown("---")
 st.caption(
-    f"Football Intelligence System • Understat xG • Odds API • NewsAPI & GDELT • "
+    f"Football Oracle • Understat xG • Odds API • NewsAPI & GDELT • "
     f"OpenWeather • MyMemory fordítás • Derby kizárás • Duplázó algoritmus • "
     f"Frissítve: {datetime.now().astimezone().strftime('%Y.%m.%d %H:%M')}"
 )
