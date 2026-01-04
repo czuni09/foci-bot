@@ -954,5 +954,5 @@ with tab3:
     df_preds = pd.read_sql("SELECT * FROM predictions ORDER BY id DESC LIMIT 50", con)
     con.close()
     st.dataframe(df_preds)
-)
+
 
