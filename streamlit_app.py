@@ -1,17 +1,12 @@
-# ============================================================
-# TITAN – Advanced Football Betting Intelligence System
-# ============================================================
 import os
 import re
 import math
-import time
 import sqlite3
 import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote_plus
 from difflib import SequenceMatcher
-from typing import Dict, List, Tuple, Optional, Any
 
 import streamlit as st
 import pandas as pd
@@ -38,45 +33,35 @@ except ImportError:
     st.code("pip install understat", language="bash")
     st.stop()
 
-# Opcionális importok
+# Opcionális importok - feedparser NINCS kötelező
 FEEDPARSER_AVAILABLE = False
-PLOTLY_AVAILABLE = False
-
 try:
     import feedparser
     FEEDPARSER_AVAILABLE = True
 except ImportError:
-    # feedparser nincs telepítve, de a kód tovább fut
-    pass
-
-try:
-    import plotly.express as px
-    PLOTLY_AVAILABLE = True
-except ImportError:
-    pass
+    pass  # feedparser opcionális
 
 # =========================
 # STREAMLIT ALAPBEÁLLÍTÁS
 # =========================
 st.set_page_config(
-    page_title="⚽ TITAN – Strategic Intelligence",
+    page_title="⚽ Football Intelligence System",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
 # =========================
-# SECRETS / ENV (GitHub Secrets & Streamlit Secrets)
+# SECRETS / ENV
 # =========================
 def get_secret(name: str) -> str:
-    """Beolvassa a kulcsot a környezeti változókból vagy Streamlit secrets-ből."""
     return (os.getenv(name) or st.secrets.get(name, "") or "").strip()
 
 ODDS_API_KEY = get_secret("ODDS_API_KEY")
 WEATHER_API_KEY = get_secret("WEATHER_API_KEY")
 NEWS_API_KEY = get_secret("NEWS_API_KEY")
 FOOTBALL_DATA_TOKEN = get_secret("FOOTBALL_DATA_TOKEN")
-MYMEMORY_EMAIL = get_secret("MYMEMORY_EMAIL")  # Opcionális
+MYMEMORY_EMAIL = get_secret("MYMEMORY_EMAIL")
 
 # =========================
 # GLOBÁLIS KONFIGURÁCIÓ
@@ -97,37 +82,30 @@ ODDS_API_LEAGUES = {
     "soccer_france_ligue_one": "Ligue 1",
 }
 
-# Időablak
 DAYS_AHEAD = 4
 MAX_GOALS = 10
-
-# Fogadási stratégia
 TARGET_TOTAL_ODDS = 2.00
 TOTAL_ODDS_MIN = 1.85
 TOTAL_ODDS_MAX = 2.15
-TARGET_LEG_ODDS = math.sqrt(2)  # ≈1.414
+TARGET_LEG_ODDS = math.sqrt(2)
 
-# Social & hírek
 USE_GOOGLE_NEWS = True if FEEDPARSER_AVAILABLE else False
 USE_GDELT = True
 TRANSLATE_TO_HU = True
 SOCIAL_MAX_ITEMS = 8
 
-# Negatív trigger szavak
 NEGATIVE_KEYWORDS = [
     "injury", "injured", "ruled out", "out", "doubtful", "sidelined",
     "suspended", "suspension", "ban", "scandal", "arrest", "police",
     "court", "divorce", "wife", "girlfriend", "partner", "family",
 ]
 
-# Adatbázis
-DB_PATH = "titan_bot.db"
+DB_PATH = "football_bot.db"
 
 # =========================
 # DERBY / RANGADÓ KIZÁRÁS
 # =========================
 EXCLUDED_MATCHUPS = {
-    # EPL
     ("Manchester City", "Chelsea"), ("Chelsea", "Manchester City"),
     ("Manchester City", "Manchester United"), ("Manchester United", "Manchester City"),
     ("Arsenal", "Tottenham"), ("Tottenham", "Arsenal"),
@@ -136,25 +114,20 @@ EXCLUDED_MATCHUPS = {
     ("Arsenal", "Chelsea"), ("Chelsea", "Arsenal"),
     ("Manchester United", "Chelsea"), ("Chelsea", "Manchester United"),
     ("Liverpool", "Manchester City"), ("Manchester City", "Liverpool"),
-    # La Liga
     ("Real Madrid", "Barcelona"), ("Barcelona", "Real Madrid"),
     ("Atletico Madrid", "Real Madrid"), ("Real Madrid", "Atletico Madrid"),
     ("Barcelona", "Atletico Madrid"), ("Atletico Madrid", "Barcelona"),
-    # Serie A
     ("Inter", "AC Milan"), ("AC Milan", "Inter"),
     ("Juventus", "Inter"), ("Inter", "Juventus"),
     ("Juventus", "AC Milan"), ("AC Milan", "Juventus"),
     ("Roma", "Lazio"), ("Lazio", "Roma"),
-    # Bundesliga
     ("Bayern Munich", "Borussia Dortmund"), ("Borussia Dortmund", "Bayern Munich"),
-    # Ligue 1
     ("PSG", "Marseille"), ("Marseille", "PSG"),
 }
 
 EPL_BIG6 = {"Arsenal", "Chelsea", "Liverpool", "Manchester City", "Manchester United", "Tottenham"}
 
 def is_excluded_match(league_key: str, home: str, away: str) -> bool:
-    """Derby/rangadó ellenőrzés."""
     if (home, away) in EXCLUDED_MATCHUPS:
         return True
     if league_key == "epl" and home in EPL_BIG6 and away in EPL_BIG6:
@@ -162,7 +135,7 @@ def is_excluded_match(league_key: str, home: str, away: str) -> bool:
     return False
 
 # =========================
-# ADATBÁZIS (SQLite)
+# ADATBÁZIS
 # =========================
 def get_db():
     con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
@@ -182,25 +155,21 @@ def init_db():
             away TEXT,
             league TEXT,
             kickoff_utc TEXT,
-
             bet_type TEXT,
             market_key TEXT,
             selection TEXT,
             line REAL,
             bookmaker TEXT,
             odds REAL,
-
             score REAL,
             reasoning TEXT,
             xg_home REAL,
             xg_away REAL,
-
             football_data_match_id INTEGER,
             result TEXT DEFAULT 'PENDING',
             settled_at TEXT,
             home_goals INTEGER,
             away_goals INTEGER,
-
             opening_odds REAL,
             closing_odds REAL,
             clv_percent REAL,
@@ -222,7 +191,7 @@ def season_from_today() -> int:
     t = datetime.now().date()
     return t.year - 1 if t.month < 7 else t.year
 
-def parse_dt(s: str) -> Optional[datetime]:
+def parse_dt(s: str):
     if not s:
         return None
     try:
@@ -233,7 +202,7 @@ def parse_dt(s: str) -> Optional[datetime]:
         except:
             return None
 
-def fmt_local(dt: datetime) -> str:
+def fmt_local(dt):
     if not dt:
         return "—"
     try:
@@ -263,7 +232,6 @@ def norm_team(s: str) -> str:
         "manchester utd": "manchester united",
         "man utd": "manchester united",
         "bayern munchen": "bayern munich",
-        "bayern munich": "bayern munich",
         "internazionale": "inter",
         "psg": "paris saint germain",
     }
@@ -282,7 +250,7 @@ def team_match_score(a: str, b: str) -> float:
     return max(token_score, seq_score)
 
 # =========================
-# POISSON MODELL (xG → valószínűségek)
+# POISSON MODELL
 # =========================
 def poisson_pmf(lmb, k):
     return math.exp(-lmb) * (lmb ** k) / math.factorial(k)
@@ -352,7 +320,7 @@ def understat_fetch(league_key: str, season: int, days_ahead: int):
     fx.sort(key=lambda x: x.get("datetime", ""))
     return fx, results
 
-def build_team_xg_profiles(results: list[dict]):
+def build_team_xg_profiles(results: list):
     prof = {}
     def ensure(team):
         prof.setdefault(team, {"home_for": [], "home_against": [], "away_for": [], "away_against": []})
@@ -410,7 +378,6 @@ def expected_goals_from_profiles(home: str, away: str, prof: dict, base=1.35):
 # =========================
 @st.cache_data(ttl=3600, show_spinner=False)
 def translate_en_to_hu(text: str) -> str:
-    """Ingyenes magyar fordítás MyMemory API-val."""
     t = (text or "").strip()
     if not t or not TRANSLATE_TO_HU:
         return t
@@ -424,19 +391,17 @@ def translate_en_to_hu(text: str) -> str:
         data = r.json()
         out = ((data.get("responseData") or {}).get("translatedText") or "").strip()
         return out if out else t
-    except Exception as e:
-        # Ha a fordítás nem sikerül, visszaadjuk az eredetit
+    except Exception:
         return t
 
 # =========================
-# SOCIAL SIGNALS (GDELT + RSS)
+# SOCIAL SIGNALS
 # =========================
 def count_neg_hits(text: str) -> int:
     t = (text or "").lower()
     return sum(1 for k in NEGATIVE_KEYWORDS if k in t)
 
 def google_news_rss(query: str, limit=8):
-    """Google News RSS feed parser - csak akkor fut, ha a feedparser telepítve van."""
     if not FEEDPARSER_AVAILABLE:
         return []
     
@@ -455,12 +420,10 @@ def google_news_rss(query: str, limit=8):
                 "source": (e.get("source") or {}).get("title", ""),
             })
         return out
-    except Exception as e:
-        st.warning(f"Google RSS hiba: {e}")
+    except Exception:
         return []
 
 def gdelt_doc(query: str, maxrecords=8):
-    """GDELT hírek keresése."""
     try:
         url = "https://api.gdeltproject.org/api/v2/doc/doc"
         params = {
@@ -486,12 +449,10 @@ def gdelt_doc(query: str, maxrecords=8):
                 "tone": a.get("tone", None),
             })
         return out
-    except Exception as e:
-        st.warning(f"GDELT hiba: {e}")
+    except Exception:
         return []
 
 def fetch_social_signals(home: str, away: str):
-    """Hírek gyűjtése mindkét csapatról."""
     neg_terms = ["injury", "suspended", "scandal", "arrest", "divorce", "out", "doubt"]
     gnews_q = f'("{home}" OR "{away}") AND ({" OR ".join(neg_terms)})'
     gdelt_q = f'("{home}" OR "{away}") ({" OR ".join(neg_terms)})'
@@ -510,10 +471,9 @@ def fetch_social_signals(home: str, away: str):
                 tone = a.get("tone")
                 if isinstance(tone, (int, float)) and tone < -4:
                     social["neg_hits"] += 1
-    except Exception as e:
-        st.warning(f"Social signals hiba: {e}")
+    except Exception:
+        pass
 
-    # Rizikó büntetés számítás
     neg = social["neg_hits"]
     if neg <= 0:
         social["risk_penalty"] = 0.0
@@ -529,7 +489,7 @@ def fetch_social_signals(home: str, away: str):
     return social
 
 # =========================
-# IDŐJÁRÁS (OpenWeather)
+# IDŐJÁRÁS
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
 def get_weather_basic(city_guess="London"):
@@ -556,7 +516,7 @@ def get_weather_basic(city_guess="London"):
         return {"temp": None, "desc": "—", "wind": None, "humidity": None}
 
 # =========================
-# ODDS API (best prices)
+# ODDS API
 # =========================
 @st.cache_data(ttl=120, show_spinner=False)
 def odds_api_get(league_key: str):
@@ -578,10 +538,8 @@ def odds_api_get(league_key: str):
         return {"ok": False, "events": [], "msg": str(e)}
 
 def extract_best_odds(match_data: dict, home: str, away: str):
-    """Kinyeri a legjobb odds-okat H2H, Totals, Spreads piacokon."""
     bookmakers = match_data.get("bookmakers", []) or []
 
-    # H2H (1X2)
     h2h_prices = {"home": [], "draw": [], "away": []}
     for b in bookmakers:
         for mk in b.get("markets", []):
@@ -604,7 +562,6 @@ def extract_best_odds(match_data: dict, home: str, away: str):
         if prices:
             best_h2h[side] = max(prices)
 
-    # Totals (Over/Under)
     totals = {}
     for b in bookmakers:
         for mk in b.get("markets", []):
@@ -623,7 +580,6 @@ def extract_best_odds(match_data: dict, home: str, away: str):
     for key, prices in totals.items():
         best_totals[key] = max(prices)
 
-    # Spreads (handicap)
     spreads = {}
     for b in bookmakers:
         for mk in b.get("markets", []):
@@ -705,16 +661,14 @@ def fd_get_result(match_id: int):
 # =========================
 # PONTOZÁS & AJÁNLÁS
 # =========================
-def score_bet_candidate(bet: dict, xg_home: float, xg_away: float, social: dict) -> Tuple[float, str]:
+def score_bet_candidate(bet: dict, xg_home: float, xg_away: float, social: dict):
     odds = safe_float(bet.get("odds"), 1.0) or 1.0
     bet_type = bet.get("bet_type", "")
     total_xg = xg_home + xg_away
 
-    # 1. Odds komponens (cél: TARGET_LEG_ODDS)
     odds_diff = abs(odds - TARGET_LEG_ODDS)
     odds_score = max(0.0, 30.0 * (1.0 - (odds_diff / 0.6)))
 
-    # 2. xG alignment
     xg_score = 0.0
     if bet_type == "H2H":
         selection = bet.get("selection", "")
@@ -750,7 +704,7 @@ def score_bet_candidate(bet: dict, xg_home: float, xg_away: float, social: dict)
                 xg_score = 10.0
             else:
                 xg_score = -5.0
-        else:  # AWAY
+        else:
             if -xg_diff + line > 0.5:
                 xg_score = 20.0
             elif -xg_diff + line > 0:
@@ -758,10 +712,8 @@ def score_bet_candidate(bet: dict, xg_home: float, xg_away: float, social: dict)
             else:
                 xg_score = -5.0
 
-    # 3. Social penalty
     social_pen = social["risk_penalty"] * 100
 
-    # 4. Időjárás
     weather = get_weather_basic(bet.get("home", "London").split()[-1])
     weather_pen = 0.0
     if weather.get("wind") is not None and weather["wind"] >= 12:
@@ -769,11 +721,9 @@ def score_bet_candidate(bet: dict, xg_home: float, xg_away: float, social: dict)
     if isinstance(weather.get("desc"), str) and any(x in weather["desc"].lower() for x in ["eső", "zápor", "vihar"]):
         weather_pen -= 6
 
-    # Összpontszám
     raw_score = 50.0 + odds_score + xg_score - social_pen + weather_pen
     final_score = clamp(raw_score, 0.0, 100.0)
 
-    # Indoklás (magyar)
     why_parts = []
     why_parts.append(f"**Odds:** {odds:.2f} (cél: {TARGET_LEG_ODDS:.2f})")
     why_parts.append(f"**xG alap:** {xg_home:.2f} vs {xg_away:.2f} (össz: {total_xg:.2f})")
@@ -799,8 +749,7 @@ def score_bet_candidate(bet: dict, xg_home: float, xg_away: float, social: dict)
     reasoning = "\n".join(why_parts)
     return final_score, reasoning
 
-def pick_best_duo(candidates: list[dict]) -> Tuple[list[dict], float]:
-    """Kiválasztja a legjobb 2 tippet, amelyek össz-oddsa közel van a 2.00-hoz."""
+def pick_best_duo(candidates: list):
     if len(candidates) < 2:
         return [], 0.0
     best = (None, None, -1e18, 0.0)
@@ -828,10 +777,9 @@ def pick_best_duo(candidates: list[dict]) -> Tuple[list[dict], float]:
 # =========================
 # MAIN UI
 # =========================
-st.title("⚽ TITAN – Strategic Intelligence")
+st.title("⚽ Football Intelligence System")
 st.caption("Understat xG • Odds API • Hírek • Időjárás • Magyar fordítás • Derby kizárás • Duplázó algoritmus")
 
-# Status pill-ek
 status_cols = st.columns(6)
 with status_cols[0]:
     st.markdown(f"**Understat** {'✅' if UNDERSTAT_AVAILABLE else '❌'}")
@@ -848,7 +796,6 @@ with status_cols[5]:
 
 st.markdown("---")
 
-# Liga kiválasztás
 selected_leagues = st.multiselect(
     "Válassz ligákat:",
     options=list(UNDERSTAT_LEAGUES.keys()),
@@ -880,14 +827,11 @@ if run_analysis and selected_leagues:
                 if not home or not away or not kickoff:
                     continue
 
-                # Derby kizárás
                 if is_excluded_match(lk, home, away):
                     continue
 
-                # xG számítás
                 lh, la, n_home, n_away = expected_goals_from_profiles(home, away, prof)
 
-                # Odds API (hozzárendelés odds league-hez)
                 odds_league_key = None
                 for ok, ov in ODDS_API_LEAGUES.items():
                     if UNDERSTAT_LEAGUES.get(lk, "").lower() in ov.lower():
@@ -900,7 +844,6 @@ if run_analysis and selected_leagues:
                 if not odds_data["ok"]:
                     continue
 
-                # Megfelelő meccs keresése az odds adatok között
                 target_match = None
                 for ev in odds_data["events"]:
                     ev_home = ev.get("home_team", "")
@@ -911,17 +854,12 @@ if run_analysis and selected_leagues:
                 if not target_match:
                     continue
 
-                # Legjobb odds-ok kinyerése
                 best_odds = extract_best_odds(target_match, home, away)
-
-                # Social signals
                 social = fetch_social_signals(home, away)
 
-                # Jelöltek generálása különböző típusokból
-                # H2H
                 for side, odds in best_odds["h2h"].items():
                     if side == "draw":
-                        continue  # döntetlent kihagyjuk
+                        continue
                     selection = home if side == "home" else away
                     bet_type = "H2H"
                     all_candidates.append({
@@ -939,7 +877,6 @@ if run_analysis and selected_leagues:
                         "social": social,
                     })
 
-                # Totals (Over/Under)
                 for (line, direction), odds in best_odds["totals"].items():
                     if line not in (2.5, 3.5, 1.5):
                         continue
@@ -959,7 +896,6 @@ if run_analysis and selected_leagues:
                         "social": social,
                     })
 
-                # Spreads (handicap)
                 for (line, team), odds in best_odds["spreads"].items():
                     if line not in (-1.0, -0.5, 0.5, 1.0):
                         continue
@@ -980,16 +916,13 @@ if run_analysis and selected_leagues:
                         "social": social,
                     })
 
-        # Pontozás
         for c in all_candidates:
             score, reasoning = score_bet_candidate(c, c["xg_home"], c["xg_away"], c["social"])
             c["score"] = score
             c["reasoning"] = reasoning
 
-        # Duplázó kiválasztás
         best_duo, total_odds = pick_best_duo(all_candidates)
 
-    # Eredmények megjelenítése
     st.markdown("---")
     st.subheader(f"🎯 TOP 2 AJÁNLÁS (össz-odds: {total_odds:.2f})")
 
@@ -1010,11 +943,9 @@ if run_analysis and selected_leagues:
                     st.metric("xG (H/A)", f"{pick['xg_home']:.2f} / {pick['xg_away']:.2f}")
                     st.metric("Össz xG", f"{pick['xg_home'] + pick['xg_away']:.2f}")
 
-                # Részletes indoklás
                 st.markdown("#### 📊 Indoklás")
                 st.markdown(pick["reasoning"])
 
-                # Hírek (magyarul)
                 st.markdown("#### 📰 Legfrissebb hírek")
                 social = pick.get("social", {})
                 if social.get("gnews") or social.get("gdelt"):
@@ -1032,19 +963,16 @@ if run_analysis and selected_leagues:
                 else:
                     st.info("Nincs releváns hír.")
 
-                # Időjárás
                 city_guess = pick["home"].split()[-1]
                 weather = get_weather_basic(city_guess)
                 if weather["temp"] is not None:
                     st.markdown(f"#### 🌤️ Időjárás ({city_guess})")
                     desc = weather['desc']
                     if TRANSLATE_TO_HU and desc != "—":
-                        # Ha nincs lefordítva, fordítjuk
                         if not any(c in desc for c in 'áéíóöőúüű'):
                             desc = translate_en_to_hu(desc)
                     st.markdown(f"**{weather['temp']:.0f}°C**, {desc}, szél: {weather.get('wind', '?')} m/s")
 
-                # Mentés gomb
                 if st.button(f"💾 Mentés (pick {idx+1})", key=f"save_{idx}"):
                     match_id = fd_find_match_id(pick["home"], pick["away"], pick["kickoff"])
                     con = get_db()
@@ -1101,12 +1029,9 @@ if run_analysis and selected_leagues:
 else:
     st.info("Válassz ligákat és kattints az **Elemzés indítása** gombra.")
 
-# =========================
-# LÁBLÉC
-# =========================
 st.markdown("---")
 st.caption(
-    f"TITAN v2 • Understat xG • Odds API • {'GDELT + RSS' if FEEDPARSER_AVAILABLE else 'GDELT'} • OpenWeather • "
-    f"MyMemory fordítás • Derby kizárás • Duplázó algoritmus • "
+    f"Football Intelligence System • Understat xG • Odds API • {'GDELT + RSS' if FEEDPARSER_AVAILABLE else 'GDELT'} • "
+    f"OpenWeather • MyMemory fordítás • Derby kizárás • Duplázó algoritmus • "
     f"Frissítve: {datetime.now().astimezone().strftime('%Y.%m.%d %H:%M')}"
 )
