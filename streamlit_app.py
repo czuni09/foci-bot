@@ -1,73 +1,81 @@
-# =========================================================
-# TITAN – Match Intelligence & Probability Lab
-# =========================================================
-# CÉL:
-# - Futballmérkőzések valószínűségi és kockázati elemzése
-# - Understat xG + Poisson modell
-# - Piaci odds csak benchmarkként (implicit probability)
-# - Hírek (GDELT + Google RSS) → pszichológiai stressz index
-# - NINCS tippadás, NINCS kiválasztás, NINCS odds-szorzás
+# ============================================================
+# TITAN – Probability & Risk Intelligence Lab
+# ============================================================
+# PURPOSE:
+# - Football match probability analysis
+# - NO betting, NO picks, NO odds multiplication
+# - Understat xG + Poisson
+# - News-based psychological stress model
+# - Dashboard UI (charts)
+# - SQLite local persistence
 #
-# FUTÁS:
-#   python -m streamlit run app.py
-# RENDER:
-#   python -m streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
-# =========================================================
+# TECH:
+# - Streamlit
+# - Python (latest)
+# - Render compatible
+# ============================================================
 
 import os
 import math
 import time
+import json
 import sqlite3
 import asyncio
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Dict, List, Tuple
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import requests
-import feedparser
 
-# ---------------- SAFE IMPORT: aiohttp -------------------
+# =========================
+# SAFE OPTIONAL IMPORTS
+# =========================
 try:
     import aiohttp
 except Exception:
-    st.set_page_config(page_title="Missing dependency", layout="wide")
-    st.error("Hiányzó csomag: aiohttp")
-    st.code("pip install aiohttp\npip install -r requirements.txt", language="bash")
+    st.error("Missing dependency: aiohttp")
     st.stop()
 
-# ---------------- SAFE IMPORT: understat -----------------
 try:
     from understat import Understat
 except Exception:
-    st.set_page_config(page_title="Missing dependency", layout="wide")
-    st.error("Hiányzó csomag: understat")
-    st.code("pip install understat\npip install -r requirements.txt", language="bash")
+    st.error("Missing dependency: understat")
     st.stop()
 
-# =========================================================
-# STREAMLIT CONFIG (EGYSZER!)
-# =========================================================
+try:
+    import plotly.express as px
+    PLOTLY_OK = True
+except Exception:
+    PLOTLY_OK = False
+
+try:
+    import feedparser
+    FEED_OK = True
+except Exception:
+    FEED_OK = False
+
+# =========================
+# STREAMLIT CONFIG
+# =========================
 st.set_page_config(
     page_title="⚽ TITAN – Probability Lab",
     layout="wide",
     page_icon="🧠"
 )
 
-# =========================================================
+# =========================
 # ENV / SECRETS
-# =========================================================
+# =========================
 def secret(name: str) -> str:
     return (os.getenv(name) or st.secrets.get(name, "") or "").strip()
 
-ODDS_API_KEY = secret("ODDS_API_KEY")      # opcionális (benchmark)
-NEWS_API_KEY = secret("NEWS_API_KEY")      # opcionális
-MYMEMORY_EMAIL = secret("MYMEMORY_EMAIL")  # fordítás stabilizálás
+MYMEMORY_EMAIL = secret("MYMEMORY_EMAIL")
 
-# =========================================================
-# KONFIG
-# =========================================================
+# =========================
+# CONFIG
+# =========================
 LEAGUES = {
     "epl": "Premier League",
     "la_liga": "La Liga",
@@ -76,21 +84,22 @@ LEAGUES = {
     "ligue_1": "Ligue 1",
 }
 
-DAYS_AHEAD = 3
+DAYS_AHEAD = 4
 MAX_GOALS = 10
+DB_PATH = "titan_lab.db"
 
-DB_PATH = "titan_probability.db"
+NEGATIVE_KEYWORDS = [
+    "injury", "ban", "suspension", "crisis", "conflict",
+    "arrest", "investigation", "sacked", "fined"
+]
 
-# =========================================================
-# DB
-# =========================================================
+# =========================
+# DATABASE
+# =========================
 def db():
     con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
-    try:
-        con.execute("PRAGMA journal_mode=WAL;")
-        con.execute("PRAGMA synchronous=NORMAL;")
-    except Exception:
-        pass
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
     return con
 
 def init_db():
@@ -110,6 +119,7 @@ def init_db():
             p_over25 REAL,
             p_btts REAL,
             stress_index INTEGER,
+            confidence TEXT,
             notes TEXT
         )
     """)
@@ -118,20 +128,20 @@ def init_db():
 
 init_db()
 
-# =========================================================
-# MATEMATIKA – POISSON
-# =========================================================
+# =========================
+# MATHEMATICS – POISSON
+# =========================
 def poisson_prob(lmbda: float, k: int) -> float:
     return (math.exp(-lmbda) * (lmbda ** k)) / math.factorial(k)
 
-def match_probabilities(xg_home: float, xg_away: float) -> Dict[str, float]:
+def compute_probabilities(xgh: float, xga: float) -> Dict[str, float]:
     p_home = p_draw = p_away = 0.0
     p_over25 = 0.0
     p_btts = 0.0
 
     for hg in range(MAX_GOALS + 1):
         for ag in range(MAX_GOALS + 1):
-            p = poisson_prob(xg_home, hg) * poisson_prob(xg_away, ag)
+            p = poisson_prob(xgh, hg) * poisson_prob(xga, ag)
             if hg > ag:
                 p_home += p
             elif hg == ag:
@@ -151,132 +161,143 @@ def match_probabilities(xg_home: float, xg_away: float) -> Dict[str, float]:
         "btts": p_btts,
     }
 
-# =========================================================
-# HÍREK + STRESSZ INDEX
-# =========================================================
-NEGATIVE_KEYWORDS = [
-    "injury", "ban", "suspension", "crisis", "conflict",
-    "arrest", "investigation", "sacked", "fined"
-]
-
+# =========================
+# TRANSLATION (SAFE)
+# =========================
 def translate_hu(text: str) -> str:
     if not text:
         return ""
     try:
-        url = "https://api.mymemory.translated.net/get"
-        params = {
-            "q": text[:500],
-            "langpair": "en|hu"
-        }
-        if MYMEMORY_EMAIL:
-            params["de"] = MYMEMORY_EMAIL
-        r = requests.get(url, params=params, timeout=6)
+        r = requests.get(
+            "https://api.mymemory.translated.net/get",
+            params={
+                "q": text[:500],
+                "langpair": "en|hu",
+                "de": MYMEMORY_EMAIL or None
+            },
+            timeout=6
+        )
         return r.json().get("responseData", {}).get("translatedText", text)
     except Exception:
         return text
 
-def news_stress(team: str) -> Tuple[int, List[str]]:
+# =========================
+# STRESS MODEL
+# =========================
+def stress_from_news(team: str) -> Tuple[int, List[str]]:
+    if not FEED_OK:
+        return 0, []
+
     score = 0
-    lines = []
+    titles = []
 
     try:
-        rss = feedparser.parse(
+        feed = feedparser.parse(
             f"https://news.google.com/rss/search?q={team}+football"
         )
-        for e in rss.entries[:8]:
-            title = e.title.lower()
-            if any(k in title for k in NEGATIVE_KEYWORDS):
+        for e in feed.entries[:8]:
+            t = e.title.lower()
+            if any(k in t for k in NEGATIVE_KEYWORDS):
                 score -= 1
-            lines.append(translate_hu(e.title))
+            titles.append(translate_hu(e.title))
     except Exception:
         pass
 
-    score = max(-5, min(5, score))
-    return score, lines
+    return max(-5, min(5, score)), titles
 
-# =========================================================
-# UNDERSTAT
-# =========================================================
-async def fetch_understat_matches(league: str):
+# =========================
+# UNDERSTAT FETCH
+# =========================
+async def fetch_understat(league: str):
     async with aiohttp.ClientSession() as session:
         us = Understat(session)
-        return await us.get_league_fixtures(league, 2024)
+        return await us.get_league_fixtures(league)
 
-def get_matches(league_key: str):
+def get_matches(league: str):
     try:
-        return asyncio.run(fetch_understat_matches(league_key))
+        return asyncio.run(fetch_understat(league))
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        return loop.run_until_complete(fetch_understat_matches(league_key))
+        return loop.run_until_complete(fetch_understat(league))
 
-# =========================================================
+# =========================
 # UI
-# =========================================================
-st.title("🧠 TITAN – Match Probability & Risk Lab")
-st.caption("Valószínűség-alapú elemzés | nincs tippadás | kutatási cél")
+# =========================
+st.title("🧠 TITAN – Match Probability Intelligence")
+st.caption("Valószínűség • Kockázat • Kontextus | nincs tippadás")
 
-selected_leagues = st.multiselect(
+leagues = st.multiselect(
     "Ligák",
     list(LEAGUES.keys()),
     default=["epl"]
 )
 
-if st.button("Elemzés futtatása"):
-    with st.spinner("Adatok feldolgozása…"):
-        for lg in selected_leagues:
+run = st.button("Elemzés futtatása")
+
+if run:
+    with st.spinner("Elemzés folyamatban…"):
+        for lg in leagues:
             matches = get_matches(lg)
             for m in matches:
-                kickoff = datetime.fromtimestamp(int(m["datetime"]), tz=timezone.utc)
+                kickoff = datetime.fromtimestamp(
+                    int(m["datetime"]), tz=timezone.utc
+                )
                 if kickoff > datetime.now(timezone.utc) + timedelta(days=DAYS_AHEAD):
                     continue
 
                 home = m["h"]["title"]
                 away = m["a"]["title"]
 
-                xg_home = float(m["xG"]["h"])
-                xg_away = float(m["xG"]["a"])
+                xgh = float(m["xG"]["h"])
+                xga = float(m["xG"]["a"])
 
-                probs = match_probabilities(xg_home, xg_away)
+                probs = compute_probabilities(xgh, xga)
 
-                stress_h, _ = news_stress(home)
-                stress_a, _ = news_stress(away)
-                stress_index = stress_h + stress_a
+                sh, _ = stress_from_news(home)
+                sa, _ = stress_from_news(away)
+                stress = sh + sa
+
+                confidence = (
+                    "HIGH" if abs(xgh - xga) > 0.6 else
+                    "MEDIUM" if abs(xgh - xga) > 0.3 else
+                    "LOW"
+                )
 
                 con = db()
                 con.execute("""
-                    INSERT INTO analyses
-                    (created_at, league, match, kickoff_utc,
-                     xg_home, xg_away,
-                     p_home, p_draw, p_away,
-                     p_over25, p_btts,
-                     stress_index, notes)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    INSERT INTO analyses VALUES (
+                        NULL,?,?,?,?,?,?,?,?,?,?,?,?,?
+                    )
                 """, (
                     datetime.utcnow().isoformat(),
                     lg,
                     f"{home} vs {away}",
                     kickoff.isoformat(),
-                    xg_home,
-                    xg_away,
+                    xgh,
+                    xga,
                     probs["home"],
                     probs["draw"],
                     probs["away"],
                     probs["over25"],
                     probs["btts"],
-                    stress_index,
-                    "Model: Understat xG + Poisson"
+                    stress,
+                    confidence,
+                    "Understat xG + Poisson + stress"
                 ))
                 con.commit()
                 con.close()
 
-        st.success("Elemzés kész.")
+        st.success("Elemzés elkészült.")
 
-# =========================================================
-# MEGJELENÍTÉS
-# =========================================================
+# =========================
+# DATA VIEW
+# =========================
 con = db()
-df = pd.read_sql("SELECT * FROM analyses ORDER BY id DESC LIMIT 50", con)
+df = pd.read_sql(
+    "SELECT * FROM analyses ORDER BY id DESC LIMIT 100",
+    con
+)
 con.close()
 
 if not df.empty:
@@ -284,7 +305,20 @@ if not df.empty:
     for c in ["p_home", "p_draw", "p_away", "p_over25", "p_btts"]:
         df_show[c] = (df_show[c] * 100).round(1)
 
+    st.subheader("Eredmények")
     st.dataframe(df_show, use_container_width=True)
+
+    if PLOTLY_OK:
+        st.subheader("Valószínűségi megoszlás")
+        fig = px.histogram(
+            df,
+            x="p_home",
+            nbins=20,
+            title="Hazai győzelem valószínűség eloszlás"
+        )
+        st.plotly_chart(fig, use_container_width=True)
 else:
-    st.info("Még nincs elemzés lefuttatva.")
+    st.info("Még nincs adat.")
+
+
 
