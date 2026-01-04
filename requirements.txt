@@ -9,10 +9,10 @@ feedparser==6.0.11
 aiohttp==3.9.3
 httpx==0.26.0
 
-# Data Manipulation & Analysis (CRITICAL FOR YOUR BOT)
+# Data Manipulation & Analysis
 numpy==1.26.2
 pandas==2.1.4
-scipy==1.11.4   # Poisson-eloszláshoz lehet szükség
+scipy==1.11.4
 
 # Date & Time Handling
 python-dateutil==2.8.2
