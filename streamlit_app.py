@@ -33,13 +33,9 @@ except ImportError:
     st.code("pip install understat", language="bash")
     st.stop()
 
-# Opcionális importok - feedparser NINCS kötelező
+# Feedparser - TELEPÍTETLEN KORLÁTOZÁS
 FEEDPARSER_AVAILABLE = False
-try:
-    import feedparser
-    FEEDPARSER_AVAILABLE = True
-except ImportError:
-    pass  # feedparser opcionális
+# Feedparser NEM kerül importálásra - helyette alternatív megoldás
 
 # =========================
 # STREAMLIT ALAPBEÁLLÍTÁS
@@ -89,7 +85,8 @@ TOTAL_ODDS_MIN = 1.85
 TOTAL_ODDS_MAX = 2.15
 TARGET_LEG_ODDS = math.sqrt(2)
 
-USE_GOOGLE_NEWS = True if FEEDPARSER_AVAILABLE else False
+# Social & hírek - feedparser nélkül
+USE_GOOGLE_NEWS = False  # Google RSS nem működik feedparser nélkül
 USE_GDELT = True
 TRANSLATE_TO_HU = True
 SOCIAL_MAX_ITEMS = 8
@@ -395,33 +392,43 @@ def translate_en_to_hu(text: str) -> str:
         return t
 
 # =========================
-# SOCIAL SIGNALS
+# SOCIAL SIGNALS - FEEDPARSER NÉLKÜL
 # =========================
 def count_neg_hits(text: str) -> int:
     t = (text or "").lower()
     return sum(1 for k in NEGATIVE_KEYWORDS if k in t)
 
-def google_news_rss(query: str, limit=8):
-    if not FEEDPARSER_AVAILABLE:
-        return []
-    
-    try:
-        q = quote_plus(query)
-        url = f"https://news.google.com/rss/search?q={q}&hl=en&gl=US&ceid=US:en"
-        feed = feedparser.parse(url)
-        out = []
-        for e in (feed.entries or [])[:limit]:
-            title = e.get("title", "")
-            out.append({
-                "title": title,
-                "title_hu": translate_en_to_hu(title),
-                "link": e.get("link", ""),
-                "published": e.get("published", ""),
-                "source": (e.get("source") or {}).get("title", ""),
-            })
-        return out
-    except Exception:
-        return []
+def google_news_api_fallback(query: str, limit=8):
+    """Google News alternatíva RSS helyett - NewsAPI vagy GDELT"""
+    # NewsAPI-t használunk ha van kulcs, különben csak GDELT
+    if NEWS_API_KEY:
+        try:
+            url = "https://newsapi.org/v2/everything"
+            params = {
+                "q": query,
+                "language": "en",
+                "sortBy": "publishedAt",
+                "pageSize": limit,
+                "apiKey": NEWS_API_KEY
+            }
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                articles = data.get("articles", [])
+                out = []
+                for a in articles:
+                    title = a.get("title", "")
+                    out.append({
+                        "title": title,
+                        "title_hu": translate_en_to_hu(title),
+                        "link": a.get("url", ""),
+                        "published": a.get("publishedAt", ""),
+                        "source": a.get("source", {}).get("name", ""),
+                    })
+                return out
+        except Exception:
+            pass
+    return []  # Ha nincs API kulcs vagy hiba
 
 def gdelt_doc(query: str, maxrecords=8):
     try:
@@ -454,15 +461,16 @@ def gdelt_doc(query: str, maxrecords=8):
 
 def fetch_social_signals(home: str, away: str):
     neg_terms = ["injury", "suspended", "scandal", "arrest", "divorce", "out", "doubt"]
-    gnews_q = f'("{home}" OR "{away}") AND ({" OR ".join(neg_terms)})'
+    news_q = f'("{home}" OR "{away}") AND ({" OR ".join(neg_terms)})'
     gdelt_q = f'("{home}" OR "{away}") ({" OR ".join(neg_terms)})'
 
-    social = {"gnews": [], "gdelt": [], "neg_hits": 0, "risk_penalty": 0.0}
+    social = {"news": [], "gdelt": [], "neg_hits": 0, "risk_penalty": 0.0}
 
     try:
-        if USE_GOOGLE_NEWS and FEEDPARSER_AVAILABLE:
-            social["gnews"] = google_news_rss(gnews_q, SOCIAL_MAX_ITEMS)
-            social["neg_hits"] += sum(count_neg_hits(x.get("title", "")) for x in social["gnews"])
+        if USE_GOOGLE_NEWS:
+            # Csak NewsAPI-t használunk
+            social["news"] = google_news_api_fallback(news_q, SOCIAL_MAX_ITEMS)
+            social["neg_hits"] += sum(count_neg_hits(x.get("title", "")) for x in social["news"])
 
         if USE_GDELT:
             social["gdelt"] = gdelt_doc(gdelt_q, SOCIAL_MAX_ITEMS)
@@ -786,13 +794,13 @@ with status_cols[0]:
 with status_cols[1]:
     st.markdown(f"**Odds API** {'✅' if ODDS_API_KEY else '❌'}")
 with status_cols[2]:
-    st.markdown(f"**Hírek** {'✅' if (FEEDPARSER_AVAILABLE or USE_GDELT) else '❌'}")
+    st.markdown(f"**Hírek** {'✅' if (NEWS_API_KEY or USE_GDELT) else '❌'}")
 with status_cols[3]:
     st.markdown(f"**Időjárás** {'✅' if WEATHER_API_KEY else '❌'}")
 with status_cols[4]:
     st.markdown(f"**Fordítás** {'✅' if TRANSLATE_TO_HU else '❌'}")
 with status_cols[5]:
-    st.markdown(f"**Feedparser** {'✅' if FEEDPARSER_AVAILABLE else '❌'}")
+    st.markdown(f"**Feedparser** {'❌' if not FEEDPARSER_AVAILABLE else '✅'}")
 
 st.markdown("---")
 
@@ -948,11 +956,11 @@ if run_analysis and selected_leagues:
 
                 st.markdown("#### 📰 Legfrissebb hírek")
                 social = pick.get("social", {})
-                if social.get("gnews") or social.get("gdelt"):
+                if social.get("news") or social.get("gdelt"):
                     news_display = []
-                    for item in social.get("gnews", [])[:3]:
+                    for item in social.get("news", [])[:3]:
                         title_hu = item.get("title_hu", item.get("title", "Nincs cím"))
-                        news_display.append(f"• **{title_hu}** (Google News)")
+                        news_display.append(f"• **{title_hu}** (NewsAPI)")
                     for item in social.get("gdelt", [])[:2]:
                         title_hu = item.get("title_hu", item.get("title", "Nincs cím"))
                         news_display.append(f"• **{title_hu}** (GDELT)")
@@ -1031,7 +1039,7 @@ else:
 
 st.markdown("---")
 st.caption(
-    f"Football Intelligence System • Understat xG • Odds API • {'GDELT + RSS' if FEEDPARSER_AVAILABLE else 'GDELT'} • "
+    f"Football Intelligence System • Understat xG • Odds API • NewsAPI & GDELT • "
     f"OpenWeather • MyMemory fordítás • Derby kizárás • Duplázó algoritmus • "
     f"Frissítve: {datetime.now().astimezone().strftime('%Y.%m.%d %H:%M')}"
 )
