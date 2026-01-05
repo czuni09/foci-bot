@@ -5,3 +5,4 @@ aiohttp==3.9.1
 feedparser==6.0.10
 plotly==5.18.0
 python-dateutil==2.8.2
+SQLAlchemy==2.0.23
