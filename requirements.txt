@@ -1,25 +1,7 @@
-# Core App & Framework
-streamlit==1.28.1
-python-dotenv==1.0.0
-
-# HTTP & API Communication
-requests==2.31.0
-feedparser==6.0.11
-# aiohttp ELTÁVOLÍTVA
-httpx==0.26.0
-
-# Data Manipulation & Analysis
-numpy==1.26.2
+streamlit==1.29.0
 pandas==2.1.4
-scipy==1.11.4
-
-# Date & Time Handling
+numpy==1.24.3
+aiohttp==3.9.1
+feedparser==6.0.10
+plotly==5.18.0
 python-dateutil==2.8.2
-pytz==2023.3
-
-# Football Data & APIs
-# understatapi ELTÁVOLÍTVA
-
-# Optional / Likely Needed
-openai==1.6.1
-cachetools==5.3.2
