@@ -1,1525 +1,922 @@
-# 📁 app.py - FŐ ALKALMAZÁS
+# streamlit_app.py
+# TITAN – Autonóm Mission Control (TOP 2 pick) + Derby/Top-rivalry kizárás + hírek magyar fordítás
+# FIXEK / FRISSÍTÉSEK:
+# - Robust run_async: ha van futó event loop, a coroutine új szálban egy új loopban fut le.
+# - Hibajelzések hiányzó csomagokra világos telepítési útmutatóval.
+# - Egyéb kisebb robosztussági javítások.
+
+import os
+import re
+import math
+import csv
+import asyncio
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from urllib.parse import quote_plus
+from concurrent.futures import ThreadPoolExecutor
+
 import streamlit as st
 import pandas as pd
-import numpy as np
-import asyncio
-import aiohttp
-import sqlite3
-import json
-import feedparser
 import requests
-from datetime import datetime, timedelta
-from dataclasses import dataclass
-from typing import Dict, List, Any, Optional
-import plotly.graph_objects as go
-import plotly.express as px
-from enum import Enum
-import time
-import os
+import feedparser
 
-# ==================== KONFIGURÁCIÓ ====================
-@dataclass
-class Config:
-    """API konfigurációk"""
-    
-    # API kulcsok (secrets-ből jönnek)
-    ODDS_API_KEY: str
-    SPORTMONKS_API_KEY: str
-    NEWS_API_KEY: str
-    WEATHER_API_KEY: str
-    
-    # API végpontok
-    SPORTMONKS_BASE_URL = "https://api.sportmonks.com/v3/football"
-    ODDS_BASE_URL = "https://api.the-odds-api.com/v4"
-    NEWS_BASE_URL = "https://newsapi.org/v2"
-    WEATHER_BASE_URL = "https://api.openweathermap.org/data/2.5"
-    
-    @classmethod
-    def load(cls):
-        """Konfiguráció betöltése"""
-        try:
-            return cls(
-                ODDS_API_KEY=st.secrets.get("ODDS_API_KEY", ""),
-                SPORTMONKS_API_KEY=st.secrets.get("SPORTMONKS_API_KEY", ""),
-                NEWS_API_KEY=st.secrets.get("NEWS_API_KEY", ""),
-                WEATHER_API_KEY=st.secrets.get("WEATHER_API_KEY", "")
-            )
-        except:
-            return cls(
-                ODDS_API_KEY=os.getenv("ODDS_API_KEY", ""),
-                SPORTMONKS_API_KEY=os.getenv("SPORTMONKS_API_KEY", ""),
-                NEWS_API_KEY=os.getenv("NEWS_API_KEY", ""),
-                WEATHER_API_KEY=os.getenv("WEATHER_API_KEY", "")
-            )
-    
-    def validate(self):
-        """API kulcsok validálása"""
-        return all([
-            self.ODDS_API_KEY,
-            self.SPORTMONKS_API_KEY,
-            self.NEWS_API_KEY,
-            self.WEATHER_API_KEY
-        ])
-
-# Konfiguráció betöltése
-CONFIG = Config.load()
-
-# ==================== ADATBÁZIS ====================
-class Database:
-    """SQLite adatbázis kezelő"""
-    
-    def __init__(self, db_path="titan_bot.db"):
-        self.db_path = db_path
-        self._init_db()
-    
-    def _init_db(self):
-        """Adatbázis inicializálása"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Mentett fogadások
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS picks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                match_id TEXT,
-                home_team TEXT,
-                away_team TEXT,
-                league TEXT,
-                pick_type TEXT,
-                pick_value TEXT,
-                odds REAL,
-                confidence REAL,
-                status TEXT,
-                result TEXT,
-                profit_loss REAL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(match_id, pick_type, pick_value)
-            )
-        ''')
-        
-        # Teljesítmény statisztika
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS performance (
-                date DATE PRIMARY KEY,
-                total_picks INTEGER DEFAULT 0,
-                wins INTEGER DEFAULT 0,
-                losses INTEGER DEFAULT 0,
-                pushes INTEGER DEFAULT 0,
-                total_stake REAL DEFAULT 0,
-                total_return REAL DEFAULT 0,
-                roi REAL DEFAULT 0
-            )
-        ''')
-        
-        # API cache
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS cache (
-                key TEXT PRIMARY KEY,
-                value TEXT,
-                expires DATETIME
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-    
-    def save_pick(self, pick_data):
-        """Fogadás mentése"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                INSERT OR REPLACE INTO picks 
-                (match_id, home_team, away_team, league, pick_type, pick_value, odds, confidence, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                pick_data.get('match_id'),
-                pick_data.get('home_team'),
-                pick_data.get('away_team'),
-                pick_data.get('league'),
-                pick_data.get('pick_type'),
-                pick_data.get('pick_value'),
-                pick_data.get('odds'),
-                pick_data.get('confidence'),
-                pick_data.get('status')
-            ))
-            
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            print(f"Mentési hiba: {e}")
-            return False
-    
-    def get_performance(self, days=30):
-        """Teljesítmény statisztika"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT 
-                COUNT(*) as total,
-                SUM(CASE WHEN result = 'WIN' THEN 1 ELSE 0 END) as wins,
-                SUM(CASE WHEN result = 'LOSS' THEN 1 ELSE 0 END) as losses,
-                AVG(CASE WHEN result = 'WIN' THEN odds ELSE NULL END) as avg_win_odds,
-                SUM(profit_loss) as total_profit
-            FROM picks 
-            WHERE timestamp >= date('now', ?)
-        ''', (f'-{days} days',))
-        
-        result = cursor.fetchone()
-        conn.close()
-        
-        if result and result[0]:
-            win_rate = (result[1] / result[0]) * 100 if result[0] > 0 else 0
-            roi = (result[4] / (result[0] * 10)) * 100 if result[0] > 0 else 0
-            
-            return {
-                'total': result[0],
-                'wins': result[1],
-                'losses': result[2],
-                'win_rate': round(win_rate, 1),
-                'avg_win_odds': round(result[3] or 0, 2),
-                'total_profit': round(result[4] or 0, 2),
-                'roi': round(roi, 1)
-            }
-        
-        return {
-            'total': 0,
-            'wins': 0,
-            'losses': 0,
-            'win_rate': 0,
-            'avg_win_odds': 0,
-            'total_profit': 0,
-            'roi': 0
-        }
-
-DB = Database()
-
-# ==================== API KEZELŐ ====================
-class RateLimiter:
-    """Rate limiting"""
-    
-    def __init__(self, calls_per_minute=30):
-        self.calls_per_minute = calls_per_minute
-        self.calls = []
-    
-    async def wait_if_needed(self):
-        """Várás ha túl gyorsan hívunk"""
-        now = time.time()
-        minute_ago = now - 60
-        
-        # Régi hívások törlése
-        self.calls = [call for call in self.calls if call > minute_ago]
-        
-        if len(self.calls) >= self.calls_per_minute:
-            wait_time = 60 - (now - self.calls[0])
-            if wait_time > 0:
-                await asyncio.sleep(wait_time)
-        
-        self.calls.append(now)
-
-class SportMonksAPI:
-    """Sportmonks API kezelő"""
-    
-    def __init__(self):
-        self.base_url = CONFIG.SPORTMONKS_BASE_URL
-        self.api_key = CONFIG.SPORTMONKS_API_KEY
-        self.headers = {"Authorization": f"Bearer {self.api_key}"}
-        self.limiter = RateLimiter(10)
-    
-    async def get_fixtures(self, date=None, league_ids=None):
-        """Meccsek lekérése"""
-        await self.limiter.wait_if_needed()
-        
-        if date is None:
-            date = datetime.now().strftime("%Y-%m-%d")
-        
-        url = f"{self.base_url}/fixtures/date/{date}"
-        params = {
-            "include": "participants;league;referee",
-            "per_page": 50
-        }
-        
-        if league_ids:
-            params["leagues"] = ",".join(map(str, league_ids))
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url,
-                    headers=self.headers,
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as response:
-                    
-                    if response.status == 200:
-                        data = await response.json()
-                        return self._process_fixtures(data.get("data", []))
-                    else:
-                        st.error(f"Sportmonks API error: {response.status}")
-                        return []
-                        
-        except Exception as e:
-            st.error(f"Sportmonks API hiba: {e}")
-            return []
-    
-    def _process_fixtures(self, fixtures):
-        """Meccs adatok feldolgozása"""
-        processed = []
-        
-        for fixture in fixtures:
-            participants = fixture.get("participants", [])
-            home_team = participants[0] if len(participants) > 0 else {}
-            away_team = participants[1] if len(participants) > 1 else {}
-            league = fixture.get("league", {})
-            referee = fixture.get("referee", {})
-            
-            # Alap statisztikák (valós API-ból jönne, most dummy)
-            stats = {
-                "home_form": ["W", "D", "L", "W", "W"],
-                "away_form": ["L", "W", "D", "L", "W"],
-                "home_xg": 1.8,
-                "away_xg": 1.4,
-                "home_goals_avg": 2.1,
-                "away_goals_avg": 1.3,
-                "home_conceded_avg": 1.2,
-                "away_conceded_avg": 1.8
-            }
-            
-            processed.append({
-                "id": fixture.get("id"),
-                "date": fixture.get("starting_at"),
-                "timestamp": fixture.get("starting_at_timestamp"),
-                "home_team": home_team.get("name", "Unknown"),
-                "away_team": away_team.get("name", "Unknown"),
-                "home_id": home_team.get("id"),
-                "away_id": away_team.get("id"),
-                "league_id": league.get("id"),
-                "league_name": league.get("name", "Unknown"),
-                "league_country": league.get("country", {}).get("name", "Unknown"),
-                "referee_id": referee.get("id"),
-                "referee": referee.get("common_name") or referee.get("name", "Unknown"),
-                "venue": fixture.get("venue", {}).get("name", "Unknown"),
-                "city": fixture.get("venue", {}).get("city", "Unknown"),
-                "status": fixture.get("status", {}).get("description", "Scheduled"),
-                **stats
-            })
-        
-        return processed
-    
-    async def get_referee_stats(self, referee_id):
-        """Bíró statisztikák"""
-        await self.limiter.wait_if_needed()
-        
-        url = f"{self.base_url}/referees/{referee_id}"
-        params = {"include": "stats.details"}
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url,
-                    headers=self.headers,
-                    params=params
-                ) as response:
-                    
-                    if response.status == 200:
-                        data = await response.json()
-                        return self._process_referee_stats(data.get("data", {}))
-                    else:
-                        return self._get_fallback_referee_stats()
-                        
-        except Exception as e:
-            st.warning(f"Bíró statisztika hiba: {e}")
-            return self._get_fallback_referee_stats()
-    
-    def _process_referee_stats(self, referee_data):
-        """Bíró statisztikák feldolgozása"""
-        if not referee_data:
-            return self._get_fallback_referee_stats()
-        
-        # Valós adatok feldolgozása
-        stats = referee_data.get("stats", [])
-        card_stats = {}
-        
-        for stat in stats:
-            if stat.get("type") == "cards":
-                details = stat.get("details", [])
-                for detail in details:
-                    card_stats[detail.get("type")] = detail.get("value")
-        
-        yellow_avg = card_stats.get("yellow_cards_avg", 3.8)
-        red_avg = card_stats.get("red_cards_avg", 0.15)
-        fouls_avg = card_stats.get("fouls_avg", 21.0)
-        
-        # Szigorúság számítás
-        strictness_score = (yellow_avg * 1) + (red_avg * 3)
-        if strictness_score > 6:
-            strictness = "Very High"
-        elif strictness_score > 4.5:
-            strictness = "High"
-        elif strictness_score > 3.5:
-            strictness = "Medium"
-        else:
-            strictness = "Low"
-        
-        return {
-            "yellow_avg": yellow_avg,
-            "red_avg": red_avg,
-            "fouls_avg": fouls_avg,
-            "strictness": strictness,
-            "total_matches": referee_data.get("total_matches", 100),
-            "country": referee_data.get("country", {}).get("name", "Unknown")
-        }
-    
-    def _get_fallback_referee_stats(self):
-        """Fallback bírói adatok"""
-        return {
-            "yellow_avg": 3.8,
-            "red_avg": 0.15,
-            "fouls_avg": 21.0,
-            "strictness": "Medium",
-            "total_matches": 100,
-            "country": "Unknown"
-        }
-    
-    async def get_leagues(self):
-        """Ligák lekérése"""
-        await self.limiter.wait_if_needed()
-        
-        url = f"{self.base_url}/leagues"
-        params = {
-            "include": "country",
-            "per_page": 100
-        }
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url,
-                    headers=self.headers,
-                    params=params
-                ) as response:
-                    
-                    if response.status == 200:
-                        data = await response.json()
-                        leagues = data.get("data", [])
-                        
-                        # Csak aktív, népszerű ligák
-                        popular_leagues = []
-                        for league in leagues:
-                            if league.get("active") and league.get("is_cup") is False:
-                                country = league.get("country", {})
-                                popular_leagues.append({
-                                    "id": league.get("id"),
-                                    "name": league.get("name"),
-                                    "country": country.get("name", "Unknown"),
-                                    "logo": league.get("logo_path")
-                                })
-                        
-                        return popular_leagues[:20]  # Első 20 legjobb
-                    else:
-                        return self._get_fallback_leagues()
-                        
-        except Exception as e:
-            st.warning(f"Ligák lekérés hiba: {e}")
-            return self._get_fallback_leagues()
-    
-    def _get_fallback_leagues(self):
-        """Fallback ligák"""
-        return [
-            {"id": 8, "name": "Premier League", "country": "England"},
-            {"id": 564, "name": "La Liga", "country": "Spain"},
-            {"id": 82, "name": "Bundesliga", "country": "Germany"},
-            {"id": 384, "name": "Serie A", "country": "Italy"},
-            {"id": 301, "name": "Ligue 1", "country": "France"},
-            {"id": 72, "name": "Eredivisie", "country": "Netherlands"},
-            {"id": 94, "name": "Primeira Liga", "country": "Portugal"}
-        ]
-
-class OddsAPI:
-    """Odds API kezelő"""
-    
-    def __init__(self):
-        self.base_url = CONFIG.ODDS_BASE_URL
-        self.api_key = CONFIG.ODDS_API_KEY
-    
-    async def get_odds(self, sport="soccer_epl"):
-        """Odds-ok lekérése"""
-        url = f"{self.base_url}/sports/{sport}/odds"
-        params = {
-            "apiKey": self.api_key,
-            "regions": "eu,us",
-            "oddsFormat": "decimal",
-            "bookmakers": "bet365,betfair,pinnacle"
-        }
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url,
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as response:
-                    
-                    if response.status == 200:
-                        return await response.json()
-                    else:
-                        return []
-                        
-        except Exception as e:
-            st.warning(f"Odds API hiba: {e}")
-            return []
-    
-    def process_match_odds(self, match_data, odds_list):
-        """Odds-ok hozzárendelése meccshez"""
-        if not odds_list:
-            return self._generate_default_odds(match_data)
-        
-        home_team = match_data.get("home_team", "").lower()
-        away_team = match_data.get("away_team", "").lower()
-        
-        for odds in odds_list:
-            odds_home = odds.get("home_team", "").lower()
-            odds_away = odds.get("away_team", "").lower()
-            
-            if (home_team in odds_home or odds_home in home_team) and \
-               (away_team in odds_away or odds_away in away_team):
-                
-                bookmakers = odds.get("bookmakers", [])
-                if bookmakers:
-                    # Legjobb odds-ok kiválasztása
-                    best_odds = self._get_best_odds(bookmakers)
-                    return best_odds
-        
-        return self._generate_default_odds(match_data)
-    
-    def _get_best_odds(self, bookmakers):
-        """Legjobb odds-ok keresése"""
-        best = {
-            "home_win": 2.0,
-            "draw": 3.4,
-            "away_win": 3.8,
-            "over_2_5": 1.9,
-            "under_2_5": 1.9,
-            "btts_yes": 1.8,
-            "btts_no": 1.95,
-            "cards_over_4_5": 2.1,
-            "cards_under_4_5": 1.7
-        }
-        
-        for bookmaker in bookmakers:
-            markets = bookmaker.get("markets", [])
-            for market in markets:
-                if market["key"] == "h2h":
-                    for outcome in market["outcomes"]:
-                        if outcome["name"] == "Home":
-                            best["home_win"] = max(best["home_win"], outcome.get("price", 2.0))
-                        elif outcome["name"] == "Away":
-                            best["away_win"] = max(best["away_win"], outcome.get("price", 3.8))
-                        elif outcome["name"] == "Draw":
-                            best["draw"] = max(best["draw"], outcome.get("price", 3.4))
-                
-                elif market["key"] == "totals":
-                    for outcome in market["outcomes"]:
-                        if outcome["name"] == "Over" and market.get("point") == 2.5:
-                            best["over_2_5"] = max(best["over_2_5"], outcome.get("price", 1.9))
-                        elif outcome["name"] == "Under" and market.get("point") == 2.5:
-                            best["under_2_5"] = max(best["under_2_5"], outcome.get("price", 1.9))
-        
-        return best
-    
-    def _generate_default_odds(self, match_data):
-        """Alapértelmezett odds-ok"""
-        return {
-            "home_win": 2.0,
-            "draw": 3.4,
-            "away_win": 3.8,
-            "over_2_5": 1.9,
-            "under_2_5": 1.9,
-            "btts_yes": 1.8,
-            "btts_no": 1.95,
-            "cards_over_4_5": 2.1,
-            "cards_under_4_5": 1.7
-        }
-
-class NewsAnalyzer:
-    """Hírek elemzése"""
-    
-    def __init__(self):
-        self.api_key = CONFIG.NEWS_API_KEY
-    
-    async def get_team_news(self, team_name, days=3):
-        """Csapat hírek"""
-        if not self.api_key:
-            return self._get_fallback_news(team_name)
-        
-        from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        
-        url = f"{CONFIG.NEWS_BASE_URL}/everything"
-        params = {
-            "apiKey": self.api_key,
-            "q": f"{team_name} football",
-            "from": from_date,
-            "language": "en",
-            "sortBy": "relevancy",
-            "pageSize": 10
-        }
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return self._analyze_sentiment(data.get("articles", []))
-                    else:
-                        return self._get_fallback_news(team_name)
-                        
-        except Exception as e:
-            return self._get_fallback_news(team_name)
-    
-    def _analyze_sentiment(self, articles):
-        """Hangulatelemzés"""
-        if not articles:
-            return {"score": 0, "reasons": [], "count": 0}
-        
-        positive_keywords = ["win", "victory", "sign", "return", "fit", "recover", "motivated"]
-        negative_keywords = ["injury", "suspended", "doubt", "crisis", "conflict", "miss", "out"]
-        
-        score = 0
-        reasons = []
-        
-        for article in articles[:5]:  # Csak első 5 cikk
-            title = article.get("title", "").lower()
-            content = article.get("content", "").lower() if article.get("content") else title
-            
-            # Pozitív szavak
-            pos_count = sum(1 for word in positive_keywords if word in content)
-            if pos_count > 0:
-                score += pos_count
-                reasons.append(f"🟢 Pozitív hír: {title[:50]}...")
-            
-            # Negatív szavak
-            neg_count = sum(1 for word in negative_keywords if word in content)
-            if neg_count > 0:
-                score -= neg_count
-                reasons.append(f"🔴 Negatív hír: {title[:50]}...")
-        
-        return {
-            "score": max(-10, min(10, score)),  # -10 és 10 között
-            "reasons": reasons[:3],  # Legfeljebb 3 ok
-            "count": len(articles)
-        }
-    
-    def _get_fallback_news(self, team_name):
-        """Fallback hírek RSS-ből"""
-        try:
-            rss_url = f"https://news.google.com/rss/search?q={team_name}+football&hl=en-US&gl=US&ceid=US:en"
-            feed = feedparser.parse(rss_url)
-            
-            score = 0
-            reasons = []
-            
-            for entry in feed.entries[:3]:
-                title = entry.title.lower()
-                if any(word in title for word in ["injury", "suspended", "doubt"]):
-                    score -= 2
-                    reasons.append(f"🔴 {entry.title[:50]}...")
-                elif any(word in title for word in ["win", "return", "sign"]):
-                    score += 2
-                    reasons.append(f"🟢 {entry.title[:50]}...")
-            
-            return {
-                "score": max(-10, min(10, score)),
-                "reasons": reasons,
-                "count": len(feed.entries[:3])
-            }
-        except:
-            return {"score": 0, "reasons": [], "count": 0}
-
-class WeatherAPI:
-    """Időjárás API"""
-    
-    def __init__(self):
-        self.api_key = CONFIG.WEATHER_API_KEY
-    
-    async def get_weather(self, city, country, match_time):
-        """Időjárás lekérése"""
-        if not self.api_key:
-            return self._get_default_weather()
-        
-        # Dátum konverzió
-        match_dt = datetime.fromisoformat(match_time.replace('Z', '+00:00'))
-        
-        # Stadion koordináták (egyszerűsítve)
-        city_coords = self._get_city_coords(city, country)
-        
-        if not city_coords:
-            return self._get_default_weather()
-        
-        url = f"{CONFIG.WEATHER_BASE_URL}/weather"
-        params = {
-            "lat": city_coords["lat"],
-            "lon": city_coords["lon"],
-            "appid": self.api_key,
-            "units": "metric"
-        }
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return self._process_weather(data, match_dt)
-                    else:
-                        return self._get_default_weather()
-                        
-        except Exception as e:
-            return self._get_default_weather()
-    
-    def _get_city_coords(self, city, country):
-        """Város koordinátái"""
-        # Főbb stadionok koordinátái (egyszerűsítve)
-        coords_db = {
-            ("london", "england"): {"lat": 51.5560, "lon": -0.2795},
-            ("manchester", "england"): {"lat": 53.4831, "lon": -2.2004},
-            ("liverpool", "england"): {"lat": 53.4308, "lon": -2.9608},
-            ("madrid", "spain"): {"lat": 40.4531, "lon": -3.6883},
-            ("barcelona", "spain"): {"lat": 41.3809, "lon": 2.1228},
-            ("milan", "italy"): {"lat": 45.4781, "lon": 9.1240},
-            ("munich", "germany"): {"lat": 48.2188, "lon": 11.6247},
-            ("paris", "france"): {"lat": 48.8414, "lon": 2.2530},
-        }
-        
-        city_lower = city.lower()
-        country_lower = country.lower()
-        
-        for (c, cntry), coord in coords_db.items():
-            if c in city_lower or city_lower in c:
-                return coord
-        
-        # Alapértelmezett: London
-        return {"lat": 51.5074, "lon": -0.1278}
-    
-    def _process_weather(self, weather_data, match_time):
-        """Időjárás adatok feldolgozása"""
-        main = weather_data.get("main", {})
-        wind = weather_data.get("wind", {})
-        rain = weather_data.get("rain", {})
-        weather = weather_data.get("weather", [{}])[0]
-        
-        wind_speed = wind.get("speed", 0)  # m/s
-        rain_1h = rain.get("1h", 0)
-        
-        # Hatás számítás
-        impact = 0
-        if wind_speed > 10:  # > 36 km/h
-            impact -= 3
-        if wind_speed > 15:  # > 54 km/h
-            impact -= 5
-        if rain_1h > 5:  # > 5mm/óra
-            impact -= 2
-        if rain_1h > 10:  # > 10mm/óra
-            impact -= 4
-        
-        return {
-            "temperature": main.get("temp", 15),
-            "wind_speed": wind_speed,
-            "wind_gust": wind.get("gust", 0),
-            "rain_1h": rain_1h,
-            "humidity": main.get("humidity", 60),
-            "description": weather.get("description", "clear"),
-            "main": weather.get("main", "Clear"),
-            "impact_score": max(-10, min(10, impact))
-        }
-    
-    def _get_default_weather(self):
-        """Alapértelmezett időjárás"""
-        return {
-            "temperature": 15,
-            "wind_speed": 3,
-            "wind_gust": 5,
-            "rain_1h": 0,
-            "humidity": 60,
-            "description": "clear sky",
-            "main": "Clear",
-            "impact_score": 0
-        }
-
-class APIManager:
-    """Összes API kezelő"""
-    
-    def __init__(self):
-        self.sportmonks = SportMonksAPI()
-        self.odds = OddsAPI()
-        self.news = NewsAnalyzer()
-        self.weather = WeatherAPI()
-    
-    async def get_matches(self, date=None, league_ids=None):
-        """Meccsek lekérése minden adattal"""
-        # 1. Alap meccs adatok
-        fixtures = await self.sportmonks.get_fixtures(date, league_ids)
-        
-        if not fixtures:
-            return []
-        
-        # 2. Odds-ok
-        odds_list = await self.odds.get_odds()
-        
-        # 3. Párhuzamos adatgyűjtés minden meccshez
-        tasks = []
-        for fixture in fixtures:
-            tasks.append(self._enrich_match(fixture, odds_list))
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # 4. Hibák szűrése
-        enriched_matches = []
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                st.warning(f"Hiba a {fixtures[i]['home_team']} vs {fixtures[i]['away_team']} adatgyűjtésnél")
-                enriched_matches.append(fixtures[i])  # Csak alap adatok
-            else:
-                enriched_matches.append(result)
-        
-        return enriched_matches
-    
-    async def _enrich_match(self, match_data, odds_list):
-        """Meccs adatok gazdagítása"""
-        enriched = match_data.copy()
-        
-        # 1. Odds-ok
-        enriched["odds"] = self.odds.process_match_odds(match_data, odds_list)
-        
-        # 2. Hírek
-        home_news = await self.news.get_team_news(match_data["home_team"])
-        away_news = await self.news.get_team_news(match_data["away_team"])
-        enriched["news"] = {
-            "home": home_news,
-            "away": away_news,
-            "combined_score": (home_news["score"] + away_news["score"]) / 2
-        }
-        
-        # 3. Időjárás
-        if match_data.get("city") and match_data.get("date"):
-            weather = await self.weather.get_weather(
-                match_data["city"],
-                match_data["league_country"],
-                match_data["date"]
-            )
-            enriched["weather"] = weather
-        
-        # 4. Bíró statisztikák
-        if match_data.get("referee_id"):
-            ref_stats = await self.sportmonks.get_referee_stats(match_data["referee_id"])
-            enriched["referee_stats"] = ref_stats
-        elif match_data.get("referee"):
-            enriched["referee_stats"] = self.sportmonks._get_fallback_referee_stats()
-        
-        return enriched
-
-# ==================== INTELLIGENCE ENGINE ====================
-class RiskLevel(Enum):
-    LOW = "🟢 AJÁNLOTT"
-    MEDIUM = "🟡 RIZIKÓS"
-    HIGH = "🔴 NEM AJÁNLOTT"
-
-class IntelligenceEngine:
-    """Fő intelligencia motor"""
-    
-    def __init__(self):
-        pass
-    
-    def analyze_match(self, match_data):
-        """Teljes meccs elemzés"""
-        try:
-            # 1. Alap statisztika (50%)
-            stats_score = self._calculate_stats_score(match_data)
-            
-            # 2. Bírói hatás (20%)
-            referee_score, ref_details = self._analyze_referee(match_data)
-            
-            # 3. Hírhatás (20%)
-            sentiment_score, sentiment_details = self._analyze_sentiment(match_data)
-            
-            # 4. Időjárás hatás (10%)
-            weather_score, weather_details = self._analyze_weather(match_data)
-            
-            # 5. Végső pontszám
-            final_score = (stats_score * 0.5) + (referee_score * 0.2) + \
-                         (sentiment_score * 0.2) + (weather_score * 0.1)
-            
-            # 6. Kockázati szint
-            risk_level = self._determine_risk_level(final_score, match_data)
-            
-            # 7. Ajánlások
-            recommendations = self._generate_recommendations(match_data, final_score)
-            
-            # 8. Indoklás
-            reasoning = self._generate_reasoning(
-                stats_score, referee_score, sentiment_score, 
-                weather_score, match_data, recommendations
-            )
-            
-            return {
-                "confidence": round(final_score, 1),
-                "risk_level": risk_level.value,
-                "metrics": {
-                    "base_stats": round(stats_score, 1),
-                    "referee_impact": round(referee_score, 1),
-                    "social_sentiment": round(sentiment_score, 1),
-                    "weather_factor": round(weather_score, 1)
-                },
-                "recommendations": recommendations,
-                "reasoning": reasoning,
-                "details": {
-                    "referee": ref_details,
-                    "sentiment": sentiment_details,
-                    "weather": weather_details
-                }
-            }
-            
-        except Exception as e:
-            st.error(f"Elemzési hiba: {e}")
-            return self._get_default_analysis(match_data)
-    
-    def _calculate_stats_score(self, match_data):
-        """Statisztikai pontszám"""
-        score = 50  # Alap
-        
-        # Forma (utolsó 5 meccs)
-        home_form = match_data.get("home_form", [])
-        away_form = match_data.get("away_form", [])
-        
-        if home_form and away_form:
-            home_points = sum([3 if r == "W" else 1 if r == "D" else 0 for r in home_form[:5]])
-            away_points = sum([3 if r == "W" else 1 if r == "D" else 0 for r in away_form[:5]])
-            form_diff = home_points - away_points
-            score += form_diff * 2
-        
-        # xG különbség
-        home_xg = match_data.get("home_xg", 1.5)
-        away_xg = match_data.get("away_xg", 1.5)
-        score += (home_xg - away_xg) * 10
-        
-        # Helyszín előny
-        score += 5
-        
-        return max(0, min(100, score))
-    
-    def _analyze_referee(self, match_data):
-        """Bírói elemzés"""
-        ref_stats = match_data.get("referee_stats", {})
-        strictness = ref_stats.get("strictness", "Medium")
-        
-        # Pontszám szigorúság alapján
-        strictness_scores = {
-            "Very High": 80,
-            "High": 70,
-            "Medium": 50,
-            "Low": 30
-        }
-        
-        score = strictness_scores.get(strictness, 50)
-        
-        # Vélemény
-        if strictness in ["Very High", "High"]:
-            verdict = f"{match_data.get('referee', 'A bíró')} szigorú ({strictness}), magas lapszám várható"
-            impact = "pozitív a lap tippre"
-        elif strictness == "Low":
-            verdict = f"{match_data.get('referee', 'A bíró')} laza ({strictness}), alacsonyabb lapszám"
-            impact = "negatív a lap tippre"
-        else:
-            verdict = f"{match_data.get('referee', 'A bíró')} átlagos szigorúságú"
-            impact = "semleges"
-        
-        return score, {"verdict": verdict, "impact": impact}
-    
-    def _analyze_sentiment(self, match_data):
-        """Hangulatelemzés"""
-        news = match_data.get("news", {})
-        combined_score = news.get("combined_score", 0)
-        
-        # Pontszám (0-100)
-        base_score = 50
-        sentiment_score = base_score + (combined_score * 10)
-        
-        # Vélemény
-        home_reasons = news.get("home", {}).get("reasons", [])
-        away_reasons = news.get("away", {}).get("reasons", [])
-        
-        if combined_score > 2:
-            verdict = "Erősen pozitív hírkörnyezet"
-            impact = "nagyon pozitív"
-        elif combined_score > 0.5:
-            verdict = "Pozitív hírkörnyezet"
-            impact = "pozitív"
-        elif combined_score > -0.5:
-            verdict = "Semleges hírkörnyezet"
-            impact = "semleges"
-        elif combined_score > -2:
-            verdict = "Negatív hírkörnyezet"
-            impact = "negatív"
-        else:
-            verdict = "Erősen negatív hírkörnyezet"
-            impact = "nagyon negatív"
-        
-        return max(0, min(100, sentiment_score)), {
-            "verdict": verdict,
-            "impact": impact,
-            "home_reasons": home_reasons[:2],
-            "away_reasons": away_reasons[:2]
-        }
-    
-    def _analyze_weather(self, match_data):
-        """Időjárás elemzés"""
-        weather = match_data.get("weather", {})
-        impact_score = weather.get("impact_score", 0)
-        
-        # Pontszám (0-100)
-        base_score = 50
-        weather_score = base_score + (impact_score * 5)
-        
-        wind_speed = weather.get("wind_speed", 0)
-        rain = weather.get("rain_1h", 0)
-        
-        if wind_speed > 15 or rain > 10:
-            verdict = "Súlyos időjárási viszonyok, jelentős hatás"
-            impact = "nagyon negatív"
-        elif wind_speed > 10 or rain > 5:
-            verdict = "Rossz időjárás, mérsékelt hatás"
-            impact = "negatív"
-        elif wind_speed > 5 or rain > 2:
-            verdict = "Kedvezőtlen időjárás, kismértékű hatás"
-            impact = "enyhén negatív"
-        else:
-            verdict = "Ideális időjárási viszonyok"
-            impact = "pozitív"
-        
-        return max(0, min(100, weather_score)), {
-            "verdict": verdict,
-            "impact": impact,
-            "wind_speed": wind_speed,
-            "rain": rain
-        }
-    
-    def _determine_risk_level(self, confidence, match_data):
-        """Kockázati szint meghatározása"""
-        extra_risk = 0
-        
-        # Kupameccs
-        if "cup" in match_data.get("league_name", "").lower():
-            extra_risk += 15
-        
-        # Derbi
-        if self._is_derby(match_data):
-            extra_risk += 10
-        
-        adjusted = confidence - extra_risk
-        
-        if adjusted >= 70:
-            return RiskLevel.LOW
-        elif adjusted >= 45:
-            return RiskLevel.MEDIUM
-        else:
-            return RiskLevel.HIGH
-    
-    def _is_derby(self, match_data):
-        """Derbi ellenőrzés"""
-        derbies = [
-            ("liverpool", "manchester united"),
-            ("manchester city", "manchester united"),
-            ("real madrid", "barcelona"),
-            ("ac milan", "inter milan"),
-            ("bayern munich", "borussia dortmund"),
-            ("arsenal", "tottenham")
-        ]
-        
-        home = match_data.get("home_team", "").lower()
-        away = match_data.get("away_team", "").lower()
-        
-        for team1, team2 in derbies:
-            if (team1 in home and team2 in away) or (team2 in home and team1 in away):
-                return True
-        return False
-    
-    def _generate_recommendations(self, match_data, confidence):
-        """Ajánlások generálása"""
-        recs = []
-        
-        # BTTS ajánlás
-        home_xg = match_data.get("home_xg", 1.5)
-        away_xg = match_data.get("away_xg", 1.5)
-        
-        if home_xg > 1.2 and away_xg > 1.2:
-            recs.append({
-                "market": "BTTS",
-                "recommendation": "IGEN",
-                "odds": match_data.get("odds", {}).get("btts_yes", 1.8),
-                "reason": "Mindkét csapat támadóerős"
-            })
-        
-        # Eredmény ajánlás
-        if confidence >= 65:
-            odds = match_data.get("odds", {})
-            recs.append({
-                "market": "1X2",
-                "recommendation": "1",
-                "odds": odds.get("home_win", 2.0),
-                "reason": "Otthoni előny és jó forma"
-            })
-        
-        # Lapok ajánlás
-        ref_strictness = match_data.get("referee_stats", {}).get("strictness", "Medium")
-        if ref_strictness in ["High", "Very High"]:
-            recs.append({
-                "market": "Lapok",
-                "recommendation": "Over 4.5",
-                "odds": match_data.get("odds", {}).get("cards_over_4_5", 2.1),
-                "reason": f"Szigorú bíró: {ref_strictness}"
-            })
-        
-        return recs
-    
-    def _generate_reasoning(self, stats, referee, sentiment, weather, match_data, recommendations):
-        """Indoklás magyar nyelven"""
-        parts = []
-        
-        # Statisztika
-        if stats >= 70:
-            parts.append("A statisztikai adatok erősen támogatják a hazai csapatot.")
-        elif stats >= 60:
-            parts.append("A statisztikák enyhe előnyt mutatnak a hazai csapatnak.")
-        else:
-            parts.append("A statisztikai adatok nem mutatnak egyértelmű előnyt.")
-        
-        # Bíró
-        if referee >= 70:
-            parts.append("A bíró szigorúsága magasabb lapszámot sugall.")
-        elif referee <= 40:
-            parts.append("A bíró lazább stílusa kevesebb lapot vet előre.")
-        
-        # Hírek
-        if sentiment >= 70:
-            parts.append("A hírkörnyezet pozitív, ami plusz motivációt adhat.")
-        elif sentiment <= 40:
-            parts.append("Negatív hírek gyengíthetik a csapat morálját.")
-        
-        # Időjárás
-        if weather <= 40:
-            parts.append("A rossz időjárás lassíthatja a játékot és csökkentheti a gólokat.")
-        
-        # Végső összegzés
-        confidence = (stats * 0.5) + (referee * 0.2) + (sentiment * 0.2) + (weather * 0.1)
-        
-        if confidence >= 70:
-            parts.append("Összességében erős ajánlás, az elemzés többsége pozitív.")
-        elif confidence >= 50:
-            parts.append("Kevert jelek, enyhe kockázattal járó ajánlás.")
-        else:
-            parts.append("Jelentős kockázatok, csak kis tétel ajánlott.")
-        
-        return " ".join(parts)
-    
-    def _get_default_analysis(self, match_data):
-        """Alapértelmezett elemzés hiba esetén"""
-        return {
-            "confidence": 50,
-            "risk_level": RiskLevel.MEDIUM.value,
-            "metrics": {"base_stats": 50, "referee_impact": 50, "social_sentiment": 50, "weather_factor": 50},
-            "recommendations": [],
-            "reasoning": "Nem sikerült teljes elemzést készíteni.",
-            "details": {}
-        }
-
-# ==================== STREAMLIT UI ====================
-def main():
-    """Fő Streamlit alkalmazás"""
-    
-    # Oldal beállítás
-    st.set_page_config(
-        page_title="INTELLIGENCE CONTROL V9.2",
-        page_icon="🛡️",
-        layout="wide",
-        initial_sidebar_state="expanded"
+# ---------- hard fail-friendly import (aiohttp) ----------
+try:
+    import aiohttp
+except Exception as e:
+    # Ha aiohttp nincs telepítve, jelezzük és megállítjuk az appot.
+    st.set_page_config(page_title="TITAN – Missing dependency", page_icon="⚠️", layout="wide")
+    st.error("Hiányzó csomag: **aiohttp**")
+    st.code(
+        "pip install aiohttp\npip install -r requirements.txt\n\nRender/Cloud esetén: ellenőrizd, hogy a requirements.txt-ben benne van: aiohttp",
+        language="bash",
     )
-    
-    # CSS stílusok
-    st.markdown("""
-        <style>
-        .main-header {
-            background: linear-gradient(135deg, #0f0f23 0%, #1a1a2e 100%);
-            padding: 25px;
-            border-radius: 15px;
-            margin-bottom: 30px;
-            border-left: 8px solid #00ff41;
-            box-shadow: 0 10px 30px rgba(0, 255, 65, 0.1);
-        }
-        
-        .main-title {
-            font-family: 'Courier New', monospace;
-            font-size: 3rem;
-            font-weight: 700;
-            color: #00ff41;
-            text-align: center;
-            letter-spacing: 2px;
-            margin: 0;
-            text-shadow: 0 0 10px rgba(0, 255, 65, 0.5);
-        }
-        
-        .match-card {
-            background: linear-gradient(135deg, #0f0f23 0%, #1a1a2e 100%);
-            border-radius: 12px;
-            padding: 20px;
-            margin: 15px 0;
-            border-left: 5px solid #00ff41;
-            transition: all 0.3s ease;
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
-        }
-        
-        .match-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 15px 30px rgba(0, 255, 65, 0.15);
-        }
-        
-        .stButton > button {
-            background: linear-gradient(135deg, #00ff41 0%, #00cc33 100%);
-            color: #000;
-            font-weight: bold;
-            border: none;
-            padding: 10px 25px;
-            border-radius: 8px;
-            transition: all 0.3s ease;
-        }
-        
-        .stButton > button:hover {
-            background: linear-gradient(135deg, #00ffcc 0%, #00ff41 100%);
-            transform: scale(1.05);
-            box-shadow: 0 5px 15px rgba(0, 255, 65, 0.3);
-        }
-        
-        .metric-box {
-            background: rgba(26, 26, 46, 0.8);
-            padding: 15px;
-            border-radius: 10px;
-            border: 1px solid #333;
-            margin: 5px;
-        }
-        </style>
-    """, unsafe_allow_html=True)
-    
-    # Fejléc
-    st.markdown("""
-        <div class="main-header">
-            <h1 class="main-title">🛡️ INTELLIGENCE CONTROL V9.2</h1>
-            <p style='text-align: center; color: #aaa;'>
-                MISSION ACTIVE | SPORTMONKS API INTEGRATED | SYSTEM: OPERATIONAL
-            </p>
-        </div>
-    """, unsafe_allow_html=True)
-    
-    # API validáció
-    if not CONFIG.validate():
-        st.error("❌ HIÁNYZÓ API KULCSOK! Ellenőrizd a secrets.toml fájlt.")
-        return
-    
-    # Szidebar
-    with st.sidebar:
-        st.markdown("### 🎮 MISSION CONTROL")
-        
-        # Dátum választó
-        selected_date = st.date_input(
-            "📅 Dátum",
-            datetime.now(),
-            help="Válaszd ki az elemzendő napot"
-        )
-        
-        # Liga választó
-        st.markdown("### 🏆 Ligák")
-        
-        # Liga listázása (cache-elve)
-        @st.cache_data(ttl=3600)
-        async def get_leagues():
-            api_manager = APIManager()
-            return await api_manager.sportmonks.get_leagues()
-        
-        leagues = asyncio.run(get_leagues())
-        
-        if leagues:
-            league_options = {f"{l['name']} ({l['country']})": l['id'] for l in leagues}
-            selected_league_names = st.multiselect(
-                "Válassz ligákat",
-                list(league_options.keys()),
-                default=list(league_options.keys())[:3]
-            )
-            selected_league_ids = [league_options[name] for name in selected_league_names]
-        else:
-            st.warning("Nem sikerült lekérni a ligákat")
-            selected_league_ids = None
-        
-        # Beállítások
-        st.markdown("### ⚙️ Beállítások")
-        
-        auto_refresh = st.checkbox("🔄 Automata frissítés (60s)", value=False)
-        show_details = st.checkbox("🔍 Részletes elemzés", value=True)
-        
-        # Statisztikák
-        st.markdown("---")
-        st.markdown("### 📈 Teljesítmény")
-        
-        perf_stats = DB.get_performance(30)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("🎯 Találati arány", f"{perf_stats['win_rate']}%")
-        with col2:
-            st.metric("💰 Profit", f"{perf_stats['total_profit']}€")
-        
-        # Frissítés gomb
-        if st.button("🔄 Adatok frissítése", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
-    
-    # Fő tartalom
-    st.markdown("### 🎯 AKTÍV MECCS ELEMZÉSEK")
-    
-    # Adatok betöltése
-    @st.cache_data(ttl=300)
-    async def load_matches(date, league_ids):
-        api_manager = APIManager()
-        return await api_manager.get_matches(date.strftime("%Y-%m-%d"), league_ids)
-    
-    with st.spinner("🤖 Adatok betöltése és elemzése..."):
-        matches = asyncio.run(load_matches(selected_date, selected_league_ids))
-    
-    if not matches:
-        st.info("ℹ️ Nincsenek meccsek a kiválasztott napon.")
-        
-        # Demo adatok
-        if st.checkbox("Demo adatok betöltése"):
-            matches = [
-                {
-                    "id": 1,
-                    "home_team": "Manchester United",
-                    "away_team": "Liverpool",
-                    "league_name": "Premier League",
-                    "date": datetime.now().isoformat(),
-                    "home_xg": 1.8,
-                    "away_xg": 2.1,
-                    "referee": "Michael Oliver",
-                    "venue": "Old Trafford",
-                    "city": "Manchester",
-                    "home_form": ["W", "W", "L", "D", "W"],
-                    "away_form": ["W", "D", "W", "W", "L"]
-                },
-                {
-                    "id": 2,
-                    "home_team": "Real Madrid",
-                    "away_team": "Barcelona",
-                    "league_name": "La Liga",
-                    "date": datetime.now().isoformat(),
-                    "home_xg": 2.2,
-                    "away_xg": 1.9,
-                    "referee": "Anthony Taylor",
-                    "venue": "Santiago Bernabéu",
-                    "city": "Madrid",
-                    "home_form": ["W", "W", "W", "D", "W"],
-                    "away_form": ["W", "L", "W", "D", "W"]
-                }
-            ]
-    
-    # Elemzés motor
-    intelligence = IntelligenceEngine()
-    
-    # Meccsek megjelenítése
-    for match in matches:
-        # Elemzés
-        analysis = intelligence.analyze_match(match)
-        
-        # Kártya
-        col1, col2, col3 = st.columns([3, 2, 1])
-        
-        with col1:
-            st.markdown(f"""
-            <div class='match-card'>
-                <h3>⚽ {match['home_team']} vs {match['away_team']}</h3>
-                <p style='color: #aaa;'>
-                    🏆 {match.get('league_name', 'Unknown')} | 
-                    ⏰ {datetime.fromisoformat(match['date'].replace('Z', '+00:00')).strftime('%H:%M') if 'date' in match else 'TBA'}
-                </p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Ajánlások
-            if analysis['recommendations']:
-                for rec in analysis['recommendations']:
-                    col_a, col_b, col_c = st.columns([2, 1, 1])
-                    with col_a:
-                        st.markdown(f"**{rec['market']}**: {rec['recommendation']}")
-                    with col_b:
-                        st.metric("Odds", f"{rec['odds']:.2f}")
-                    with col_c:
-                        pick_data = {
-                            'match_id': match['id'],
-                            'home_team': match['home_team'],
-                            'away_team': match['away_team'],
-                            'league': match.get('league_name', 'Unknown'),
-                            'pick_type': rec['market'],
-                            'pick_value': rec['recommendation'],
-                            'odds': rec['odds'],
-                            'confidence': analysis['confidence'],
-                            'status': analysis['risk_level']
-                        }
-                        if st.button("💾", key=f"save_{match['id']}_{rec['market']}"):
-                            if DB.save_pick(pick_data):
-                                st.success("✅")
-                            else:
-                                st.error("❌")
-        
-        with col2:
-            # Bizalom mutató
-            color_map = {
-                "🟢 AJÁNLOTT": "#00ff41",
-                "🟡 RIZIKÓS": "#ffff00",
-                "🔴 NEM AJÁNLOTT": "#ff0000"
-            }
-            
-            color = color_map.get(analysis['risk_level'], "#aaa")
-            
-            st.markdown(f"""
-            <div style='text-align: center;'>
-                <h1 style='color: {color}; font-size: 2.5rem;'>{analysis['confidence']}%</h1>
-                <h3>{analysis['risk_level']}</h3>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col3:
-            # Gyors információk
-            if match.get('referee'):
-                st.caption(f"⚖️ {match['referee']}")
-            if match.get('venue'):
-                st.caption(f"📍 {match['venue']}")
-        
-        # Részletes elemzés
-        if show_details:
-            with st.expander("📊 Részletes elemzés"):
-                tabs = st.tabs(["📈 Metrikák", "📢 Hírek", "⚖️ Bíró", "🌤️ Időjárás"])
-                
-                with tabs[0]:
-                    # Metrikák grafikon
-                    metrics = analysis['metrics']
-                    fig = go.Figure(data=[
-                        go.Bar(
-                            x=list(metrics.keys()),
-                            y=list(metrics.values()),
-                            marker_color=['#00ff41', '#ffaa00', '#ff4444', '#4488ff'],
-                            text=list(metrics.values()),
-                            texttemplate='%{text:.1f}'
-                        )
-                    ])
-                    fig.update_layout(height=300, showlegend=False)
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Indoklás
-                    st.markdown("#### 🧠 Indoklás")
-                    st.info(analysis['reasoning'])
-                
-                with tabs[1]:
-                    # Hírek
-                    news = match.get('news', {})
-                    if news:
-                        home_news = news.get('home', {})
-                        away_news = news.get('away', {})
-                        
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.markdown(f"**{match['home_team']}**")
-                            for reason in home_news.get('reasons', [])[:2]:
-                                st.write(reason)
-                        with col2:
-                            st.markdown(f"**{match['away_team']}**")
-                            for reason in away_news.get('reasons', [])[:2]:
-                                st.write(reason)
-                    else:
-                        st.write("Nincsenek hírek")
-                
-                with tabs[2]:
-                    # Bíró
-                    ref_details = analysis['details']['referee']
-                    st.markdown(f"**Vélemény:** {ref_details['verdict']}")
-                    st.markdown(f"**Hatás:** {ref_details['impact']}")
-                
-                with tabs[3]:
-                    # Időjárás
-                    weather = match.get('weather', {})
-                    if weather:
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            st.metric("🌡️ Hőmérséklet", f"{weather.get('temperature', 0)}°C")
-                        with col2:
-                            st.metric("💨 Szél", f"{weather.get('wind_speed', 0)} m/s")
-                        with col3:
-                            st.metric("🌧️ Eső", f"{weather.get('rain_1h', 0)} mm")
-        
-        st.divider()
-    
-    # Teljesítmény grafikon
-    st.markdown("---")
-    st.markdown("### 📊 TELJESÍTMÉNY STATISZTIKA")
-    
-    perf = DB.get_performance(90)
-    
-    if perf['total'] > 0:
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            # Win rate gauge
-            fig = go.Figure(go.Indicator(
-                mode="gauge+number",
-                value=perf['win_rate'],
-                domain={'x': [0, 1], 'y': [0, 1]},
-                title={'text': "Találati arány"},
-                gauge={
-                    'axis': {'range': [0, 100]},
-                    'bar': {'color': "#00ff41"},
-                    'steps': [
-                        {'range': [0, 50], 'color': "rgba(255, 68, 68, 0.3)"},
-                        {'range': [50, 65], 'color': "rgba(255, 170, 0, 0.3)"},
-                        {'range': [65, 100], 'color': "rgba(0, 255, 65, 0.3)"}
-                    ]
-                }
-            ))
-            fig.update_layout(height=250)
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            # Profit grafikon
-            fig = go.Figure(data=[
-                go.Scatter(
-                    y=[0, perf['total_profit']],
-                    mode="lines+markers",
-                    line=dict(color="#00ff41", width=4),
-                    marker=dict(size=15)
-                )
-            ])
-            fig.update_layout(title="Profit", height=250)
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col3:
-            # Összefoglaló
-            st.markdown("#### 📈 Összefoglaló")
-            st.metric("Összes fogadás", perf['total'])
-            st.metric("Nyereség/Veszteség", f"{perf['wins']}/{perf['losses']}")
-            st.metric("ROI", f"{perf['roi']}%")
-    
-    # Automata frissítés
-    if auto_refresh:
-        st.markdown("---")
-        st.caption(f"Utolsó frissítés: {datetime.now().strftime('%H:%M:%S')}")
-        time.sleep(60)
-        st.rerun()
+    st.stop()
 
-# ==================== ALKALMAZÁS FUTTATÁSA ====================
-if __name__ == "__main__":
-    main()
+# Understat lib (aiohttp session-t kér)
+try:
+    from understat import Understat
+except Exception:
+    st.set_page_config(page_title="TITAN – Missing dependency", page_icon="⚠️", layout="wide")
+    st.error("Hiányzó csomag: **understat**")
+    st.code("pip install understat\npip install -r requirements.txt", language="bash")
+    st.stop()
+
+# =========================================================
+#  FIX KONFIG (nincs kontroll panel)
+# =========================================================
+st.set_page_config(page_title="TITAN – Mission Control", page_icon="🛰️", layout="wide")
+
+LEAGUES = {
+    "epl": "Premier League",
+    "la_liga": "La Liga",
+    "bundesliga": "Bundesliga",
+    "serie_a": "Serie A",
+    "ligue_1": "Ligue 1",
+}
+DAYS_AHEAD = 4
+TOP_K = 2
+MAX_GOALS = 10
+
+# Social (kulcs nélkül)
+USE_GOOGLE_NEWS_RSS = True
+USE_GDELT = True
+SOCIAL_MAX_ITEMS = 12
+SHOW_SOCIAL_DETAILS = True
+TRANSLATE_TO_HU = True  # hírek címének magyarítása
+
+# Backtest
+PICKS_LOG_PATH = Path("picks_log.csv")
+AUTO_LOG_TOP_PICKS = True
+
+# =========================================================
+#  Secrets / ENV (kulcsok csak secrets/env)
+# =========================================================
+def _secret(name: str) -> str:
+    return (os.getenv(name) or st.secrets.get(name, "") or "").strip()
+
+NEWS_API_KEY = _secret("NEWS_API_KEY")        # opcionális
+WEATHER_API_KEY = _secret("WEATHER_API_KEY")  # opcionális
+ODDS_API_KEY = _secret("ODDS_API_KEY")        # opcionális
+FOOTBALL_DATA_TOKEN = _secret("FOOTBALL_DATA_TOKEN")  # opcionális
+
+# =========================================================
+#  UI – Mission Control
+# =========================================================
+st.markdown(
+    """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=Space+Grotesk:wght@700;800&display=swap');
+:root{
+  --bg0:#06070c; --bg1:#0b1020;
+  --card: rgba(255,255,255,0.065); --card2: rgba(255,255,255,0.045);
+  --border: rgba(255,255,255,0.11);
+  --text: rgba(255,255,255,0.92); --muted: rgba(255,255,255,0.66);
+  --good:#4ef0a3; --warn:#ffd166; --bad:#ff5c8a;
+  --accent:#79a6ff; --accent2:#b387ff;
+}
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; color: var(--text); }
+.stApp{
+  background:
+    radial-gradient(950px 540px at 16% 10%, rgba(121,166,255,0.18), transparent 60%),
+    radial-gradient(760px 430px at 86% 16%, rgba(179,135,255,0.14), transparent 55%),
+    linear-gradient(135deg, var(--bg0) 0%, var(--bg1) 50%, var(--bg0) 100%);
+}
+.hdr{
+  font-family: 'Space Grotesk', sans-serif; font-weight: 800;
+  font-size: 2.05rem; margin: 0.15rem 0 0.1rem 0;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+}
+.sub{ color: var(--muted); margin-bottom: 0.6rem; }
+.row{ display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; }
+.pill{
+  display:inline-flex; align-items:center; gap:8px;
+  padding: 4px 10px; border-radius: 999px;
+  border: 1px solid var(--border); background: rgba(255,255,255,0.04);
+  font-size: 0.86rem; color: rgba(255,255,255,0.86);
+  white-space:nowrap;
+}
+.tag-good{ border-color: rgba(78,240,163,0.38); background: rgba(78,240,163,0.11); }
+.tag-warn{ border-color: rgba(255,209,102,0.44); background: rgba(255,209,102,0.11); }
+.tag-bad { border-color: rgba(255,92,138,0.44); background: rgba(255,92,138,0.12); }
+.panel{
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 18px; padding: 14px 14px 10px 14px;
+  box-shadow: 0 18px 55px rgba(0,0,0,0.42); margin: 10px 0;
+}
+.card{
+  background: var(--card2); border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 18px; padding: 14px 14px 10px 14px; margin: 10px 0;
+  box-shadow: 0 14px 45px rgba(0,0,0,0.40);
+}
+.grid{ display:grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 10px; }
+@media (max-width: 900px){ .grid{ grid-template-columns: 1fr; } }
+.metricbox{
+  background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 16px; padding: 10px 12px;
+}
+.mtitle{ color: var(--muted); font-size: 0.82rem; margin-bottom: 4px;}
+.mval{ font-weight: 800; font-size: 1.08rem; }
+.small{ color: var(--muted); font-size: 0.9rem; }
+.signal{
+  display:inline-flex; align-items:center; gap:8px;
+  padding: 3px 8px; border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.035);
+  font-size: 0.82rem; color: rgba(255,255,255,0.84);
+}
+hr{ border: none; border-top: 1px solid rgba(255,255,255,0.10); margin: 1rem 0; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+st.markdown('<div class="hdr">🛰️ TITAN – Mission Control</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="sub">Autonóm: <b>mindig 2 legjobb pick</b> • Derbik/rivális rangadók kizárva • '
+    'Hír/narratíva: <b>csak rizikó-penalty</b> + magyar fordítás.</div>',
+    unsafe_allow_html=True,
+)
+
+# =========================================================
+#  Utils
+# =========================================================
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def season_from_today() -> int:
+    t = datetime.now().date()
+    return t.year - 1 if t.month < 7 else t.year
+
+def parse_dt(s: str):
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except Exception:
+        # próbáljuk ISO formátummal
+        try:
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return None
+
+def fmt_local(dt):
+    if not dt:
+        return "—"
+    try:
+        return dt.astimezone().strftime("%Y.%m.%d %H:%M")
+    except Exception:
+        return dt.strftime("%Y.%m.%d %H:%M")
+
+def clamp(x, a, b):
+    return max(a, min(b, x))
+
+def safe_float(x, default=None):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def clean_team(name: str) -> str:
+    name = (name or "").strip()
+    name = re.sub(r"\s+", " ", name)
+    return name
+
+def stable_match_id(league_key: str, kickoff_dt: datetime, home: str, away: str) -> str:
+    k = kickoff_dt.strftime("%Y%m%d%H%M") if kickoff_dt else "0000"
+    return f"{league_key}:{k}:{home.lower()}__{away.lower()}"
+
+# =========================================================
+#  Derby / rival exclusions (kérésedre)
+# =========================================================
+EXCLUDED_MATCHUPS = {
+    ("Manchester City", "Chelsea"),
+    ("Chelsea", "Manchester City"),
+    ("Manchester City", "Manchester United"),
+    ("Manchester United", "Manchester City"),
+    ("Arsenal", "Tottenham"),
+    ("Tottenham", "Arsenal"),
+    ("Liverpool", "Everton"),
+    ("Everton", "Liverpool"),
+    ("Liverpool", "Manchester United"),
+    ("Manchester United", "Liverpool"),
+    ("Arsenal", "Chelsea"),
+    ("Chelsea", "Arsenal"),
+    ("Manchester United", "Chelsea"),
+    ("Chelsea", "Manchester United"),
+    ("Liverpool", "Manchester City"),
+    ("Manchester City", "Liverpool"),
+    ("Real Madrid", "Barcelona"),
+    ("Barcelona", "Real Madrid"),
+    ("Atletico Madrid", "Real Madrid"),
+    ("Real Madrid", "Atletico Madrid"),
+    ("Barcelona", "Atletico Madrid"),
+    ("Atletico Madrid", "Barcelona"),
+    ("Inter", "AC Milan"),
+    ("AC Milan", "Inter"),
+    ("Juventus", "Inter"),
+    ("Inter", "Juventus"),
+    ("Juventus", "AC Milan"),
+    ("AC Milan", "Juventus"),
+    ("Roma", "Lazio"),
+    ("Lazio", "Roma"),
+    ("Bayern Munich", "Borussia Dortmund"),
+    ("Borussia Dortmund", "Bayern Munich"),
+    ("PSG", "Marseille"),
+    ("Marseille", "PSG"),
+}
+
+EPL_BIG6 = {"Arsenal", "Chelsea", "Liverpool", "Manchester City", "Manchester United", "Tottenham"}
+
+def is_excluded_match(league_key: str, home: str, away: str) -> bool:
+    if (home, away) in EXCLUDED_MATCHUPS:
+        return True
+    if league_key == "epl" and home in EPL_BIG6 and away in EPL_BIG6:
+        return True
+    return False
+
+# =========================================================
+#  Poisson model
+# =========================================================
+def poisson_pmf(lmb, k):
+    return math.exp(-lmb) * (lmb ** k) / math.factorial(k)
+
+def prob_over_25(lh, la, max_goals=MAX_GOALS):
+    p = 0.0
+    for i in range(max_goals + 1):
+        for j in range(max_goals + 1):
+            if i + j >= 3:
+                p += poisson_pmf(lh, i) * poisson_pmf(la, j)
+    return clamp(p, 0.0, 1.0)
+
+def prob_btts(lh, la):
+    p = 1 - math.exp(-lh) - math.exp(-la) + math.exp(-(lh + la))
+    return clamp(p, 0.0, 1.0)
+
+def prob_1x2(lh, la, max_goals=MAX_GOALS):
+    ph = pdw = pa = 0.0
+    for i in range(max_goals + 1):
+        pi = poisson_pmf(lh, i)
+        for j in range(max_goals + 1):
+            pj = poisson_pmf(la, j)
+            if i > j:
+                ph += pi * pj
+            elif i == j:
+                pdw += pi * pj
+            else:
+                pa += pi * pj
+    s = ph + pdw + pa
+    if s > 0:
+        ph, pdw, pa = ph / s, pdw / s, pa / s
+    return clamp(ph, 0.0, 1.0), clamp(pdw, 0.0, 1.0), clamp(pa, 0.0, 1.0)
+
+# =========================================================
+#  Social: Google News RSS + GDELT
+#  + Magyar fordítás (MyMemory – kulcs nélkül)
+# =========================================================
+NEG_KEYWORDS = [
+    "injury", "injured", "ruled out", "out", "doubtful", "sidelined",
+    "suspended", "suspension", "ban",
+    "scandal", "arrest", "police", "court",
+    "divorce", "wife", "girlfriend", "partner", "family",
+]
+
+def count_neg_hits(text: str) -> int:
+    t = (text or "").lower()
+    return sum(1 for k in NEG_KEYWORDS if k in t)
+
+def google_news_rss(query: str, hl="en", gl="US", ceid="US:en", limit=12):
+    q = quote_plus(query)
+    url = f"https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
+    feed = feedparser.parse(url)
+    out = []
+    for e in (feed.entries or [])[:limit]:
+        out.append({
+            "title": e.get("title", ""),
+            "link": e.get("link", ""),
+            "published": e.get("published", ""),
+            "source": (e.get("source") or {}).get("title", ""),
+        })
+    return out
+
+def gdelt_doc(query: str, maxrecords=12):
+    url = "https://api.gdeltproject.org/api/v2/doc/doc"
+    params = {
+        "query": query,
+        "mode": "ArtList",
+        "format": "json",
+        "maxrecords": maxrecords,
+        "sort": "HybridRel",
+    }
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    arts = data.get("articles", []) or []
+    out = []
+    for a in arts:
+        out.append({
+            "title": a.get("title", ""),
+            "url": a.get("url", ""),
+            "domain": a.get("domain", ""),
+            "seendate": a.get("seendate", ""),
+            "tone": a.get("tone", None),
+        })
+    return out
+
+def build_social_query_pack(home: str, away: str):
+    neg_terms = ["injury", "suspended", "scandal", "divorce", "arrest"]
+    gnews_q = f'({home} OR "{away}") AND ({ " OR ".join(neg_terms) })'
+    gdelt_q = f'({home} OR "{away}") ({ " OR ".join(neg_terms) })'
+    return gnews_q, gdelt_q
+
+def social_penalty(neg_hits: int) -> float:
+    if neg_hits <= 0: return 0.00
+    if neg_hits == 1: return 0.05
+    if neg_hits == 2: return 0.08
+    if 3 <= neg_hits <= 4: return 0.12
+    return 0.15
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def translate_en_to_hu(text: str) -> str:
+    """
+    Ingyenes fordítás MyMemory-val (kulcs nélkül).
+    Ha nem elérhető, visszaadja az eredetit.
+    """
+    t = (text or "").strip()
+    if not t:
+        return t
+    try:
+        url = "https://api.mymemory.translated.net/get"
+        params = {"q": t, "langpair": "en|hu"}
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        out = ((data.get("responseData") or {}).get("translatedText") or "").strip()
+        return out if out else t
+    except Exception:
+        return t
+
+def maybe_hu(text: str) -> str:
+    if not TRANSLATE_TO_HU:
+        return text
+    return translate_en_to_hu(text)
+
+# =========================================================
+#  Understat async runner (Streamlit-safe)
+# =========================================================
+def run_async(coro):
+    """
+    Robust async runner:
+    - Ha nincs futó event loop: asyncio.run(coro)
+    - Ha van már futó loop (pl. Streamlit), külön szálban hozunk létre egy új event loop-ot és ott futtatjuk a coroutine-t.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # nincs futó loop, biztonságosan futtathatjuk
+        return asyncio.run(coro)
+    else:
+        # van futó loop: futtassuk új loop-ban új szálban
+        def _run_in_new_loop(c):
+            new_loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(new_loop)
+                return new_loop.run_until_complete(c)
+            finally:
+                try:
+                    new_loop.close()
+                except Exception:
+                    pass
+
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_run_in_new_loop, coro)
+            return fut.result()
+
+@st.cache_data(ttl=600, show_spinner=False)
+def understat_fetch(league_key: str, season: int, days_ahead: int):
+    async def _run():
+        async with aiohttp.ClientSession() as session:
+            u = Understat(session)
+            fixtures = await u.get_league_fixtures(league_key, season)
+            results = await u.get_league_results(league_key, season)
+            return fixtures or [], results or []
+    fixtures, results = run_async(_run())
+
+    now = now_utc()
+    limit = now + timedelta(days=days_ahead)
+    fx = []
+    for m in fixtures:
+        dt = parse_dt(m.get("datetime", ""))
+        if not dt:
+            continue
+        if now <= dt <= limit:
+            fx.append(m)
+    fx.sort(key=lambda x: x.get("datetime", ""))
+    return fx, results
+
+def build_team_xg_profiles(results: list[dict]):
+    prof = {}
+    def ensure(team):
+        prof.setdefault(team, {"home_for": [], "home_against": [], "away_for": [], "away_against": []})
+
+    for m in results or []:
+        h = clean_team(((m.get("h") or {}).get("title")))
+        a = clean_team(((m.get("a") or {}).get("title")))
+        xgh = safe_float(((m.get("xG") or {}).get("h")))
+        xga = safe_float(((m.get("xG") or {}).get("a")))
+        if not h or not a or xgh is None or xga is None:
+            continue
+        ensure(h); ensure(a)
+        prof[h]["home_for"].append(xgh)
+        prof[h]["home_against"].append(xga)
+        prof[a]["away_for"].append(xga)
+        prof[a]["away_against"].append(xgh)
+
+    out = {}
+    for team, d in prof.items():
+        hf = d["home_for"]; ha = d["home_against"]
+        af = d["away_for"]; aa = d["away_against"]
+        out[team] = {
+            "home_xg_for": sum(hf)/len(hf) if hf else None,
+            "home_xg_against": sum(ha)/len(ha) if ha else None,
+            "away_xg_for": sum(af)/len(af) if af else None,
+            "away_xg_against": sum(aa)/len(aa) if aa else None,
+            "n_home": len(hf),
+            "n_away": len(af),
+        }
+    return out
+
+def expected_goals_from_profiles(home: str, away: str, prof: dict, base=1.35):
+    ph = prof.get(home, {})
+    pa = prof.get(away, {})
+
+    h_for = ph.get("home_xg_for")
+    h_against = ph.get("home_xg_against")
+    a_for = pa.get("away_xg_for")
+    a_against = pa.get("away_xg_against")
+
+    lh_parts = []
+    if h_for is not None: lh_parts.append(h_for)
+    if a_against is not None: lh_parts.append(a_against)
+    lh = sum(lh_parts)/len(lh_parts) if lh_parts else base
+
+    la_parts = []
+    if a_for is not None: la_parts.append(a_for)
+    if h_against is not None: la_parts.append(h_against)
+    la = sum(la_parts)/len(la_parts) if la_parts else base
+
+    lh = clamp(lh, 0.2, 3.5)
+    la = clamp(la, 0.2, 3.5)
+
+    n_home = int(ph.get("n_home", 0) or 0)
+    n_away = int(pa.get("n_away", 0) or 0)
+    return lh, la, n_home, n_away
+
+def label_risk(n_home: int, n_away: int, extra_penalty: float):
+    if n_home >= 8 and n_away >= 8 and extra_penalty < 0.08:
+        return "MEGBÍZHATÓ", "tag-good"
+    if n_home >= 4 and n_away >= 4 and extra_penalty < 0.12:
+        return "RIZIKÓS", "tag-warn"
+    return "NAGYON RIZIKÓS", "tag-bad"
+
+def pick_recommendation(lh, la, p1, px, p2, pbtts, pover25):
+    total_xg = lh + la
+    if pbtts >= 0.58 and total_xg >= 2.55:
+        return ("BTTS – IGEN", pbtts, f"Mindkét csapat gól esélyes (össz xG ~ {total_xg:.2f}).")
+    if pover25 >= 0.56 and total_xg >= 2.60:
+        return ("Over 2.5 gól", pover25, f"Magas gólvárakozás (össz xG ~ {total_xg:.2f}).")
+
+    mx = max(p1, px, p2)
+    if mx == p1:
+        return ("Hazai győzelem (1)", p1, f"Hazai oldal valószínűbb (~{p1*100:.0f}%).")
+    if mx == p2:
+        return ("Vendég győzelem (2)", p2, f"Vendég oldal valószínűbb (~{p2*100:.0f}%).")
+    return ("Döntetlen (X)", px, f"Döntetlen valószínűbb (~{px*100:.0f}%).")
+
+def compute_reliability(conf: float) -> int:
+    return int(clamp(conf * 100, 0, 100))
+
+# =========================================================
+#  Backtest log + ellenőrzés (alap: mentés + táblázat)
+# =========================================================
+LOG_FIELDS = [
+    "logged_utc", "league_key", "league", "season", "match_id",
+    "kickoff_utc", "kickoff_local", "home", "away",
+    "pick", "confidence", "risk_label",
+    "social_neg_hits", "social_penalty",
+    "result_home", "result_away", "outcome",
+]
+
+def ensure_log_file():
+    if not PICKS_LOG_PATH.exists():
+        with PICKS_LOG_PATH.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+            w.writeheader()
+
+def read_log_df() -> pd.DataFrame:
+    if not PICKS_LOG_PATH.exists():
+        return pd.DataFrame(columns=LOG_FIELDS)
+    return pd.read_csv(PICKS_LOG_PATH)
+
+def append_log_rows(rows: list[dict]):
+    ensure_log_file()
+    existing = set()
+    df = read_log_df()
+    if not df.empty:
+        for _, r in df.iterrows():
+            existing.add(f"{r.get('match_id','')}|{r.get('pick','')}")
+    with PICKS_LOG_PATH.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+        for row in rows:
+            key = f"{row.get('match_id','')}|{row.get('pick','')}"
+            if key in existing:
+                continue
+            w.writerow(row)
+
+def eval_pick_outcome(pick: str, gh: int, ga: int) -> str:
+    pick = (pick or "").strip().lower()
+    if gh is None or ga is None:
+        return "UNKNOWN"
+    total = gh + ga
+    if "btts" in pick:
+        return "WIN" if (gh >= 1 and ga >= 1) else "LOSS"
+    if "over 2.5" in pick:
+        return "WIN" if total >= 3 else "LOSS"
+    if "(1)" in pick or "hazai" in pick:
+        return "WIN" if gh > ga else ("PUSH" if gh == ga else "LOSS")
+    if "(2)" in pick or "vend" in pick:
+        return "WIN" if ga > gh else ("PUSH" if gh == ga else "LOSS")
+    if "(x)" in pick or "döntetlen" in pick or "dontetlen" in pick:
+        return "WIN" if gh == ga else "LOSS"
+    return "UNKNOWN"
+
+@st.cache_data(ttl=600, show_spinner=False)
+def understat_results_for_league(league_key: str, season: int):
+    async def _run():
+        async with aiohttp.ClientSession() as session:
+            u = Understat(session)
+            results = await u.get_league_results(league_key, season)
+            return results or []
+    return run_async(_run())
+
+def find_result_for_match(results: list[dict], home: str, away: str, kickoff_utc: datetime):
+    best = None
+    best_diff = None
+    for m in results or []:
+        h = clean_team(((m.get("h") or {}).get("title")))
+        a = clean_team(((m.get("a") or {}).get("title")))
+        if h.lower() != home.lower() or a.lower() != away.lower():
+            continue
+        dt = parse_dt(m.get("datetime", ""))
+        if not dt:
+            continue
+        diff = abs((dt - kickoff_utc).total_seconds())
+        if diff <= 36 * 3600:
+            if best is None or diff < best_diff:
+                best = m
+                best_diff = diff
+    if not best:
+        return None
+    gh = safe_float(((best.get("goals") or {}).get("h")), None)
+    ga = safe_float(((best.get("goals") or {}).get("a")), None)
+    if gh is None or ga is None:
+        return None
+    return int(gh), int(ga)
+
+def verify_log_outcomes():
+    df = read_log_df()
+    if df.empty:
+        return df, 0
+    unresolved = df[(df["outcome"].isna()) | (df["outcome"].astype(str) == "") | (df["outcome"].astype(str) == "UNKNOWN")]
+    if unresolved.empty:
+        return df, 0
+
+    updated = 0
+    cache_results = {}
+    for idx, row in unresolved.iterrows():
+        league_key = str(row.get("league_key", ""))
+        season = int(row.get("season", season_from_today()))
+        home = str(row.get("home", ""))
+        away = str(row.get("away", ""))
+        kick_str = str(row.get("kickoff_utc", ""))
+        try:
+            kickoff_utc = datetime.fromisoformat(kick_str)
+            if kickoff_utc.tzinfo is None:
+                kickoff_utc = kickoff_utc.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+
+        if league_key not in cache_results:
+            cache_results[league_key] = understat_results_for_league(league_key, season)
+
+        res = find_result_for_match(cache_results[league_key], home, away, kickoff_utc)
+        if not res:
+            continue
+        gh, ga = res
+        outcome = eval_pick_outcome(str(row.get("pick", "")), gh, ga)
+        df.at[idx, "result_home"] = gh
+        df.at[idx, "result_away"] = ga
+        df.at[idx, "outcome"] = outcome
+        updated += 1
+
+    if updated > 0:
+        df.to_csv(PICKS_LOG_PATH, index=False)
+    return df, updated
+
+# =========================================================
+#  Build match analysis (CORE + social penalty + derby exclude)
+# =========================================================
+def build_match_analysis(league_key: str, league_name: str, season: int, home: str, away: str, kickoff_dt: datetime, prof: dict):
+    lh, la, n_home, n_away = expected_goals_from_profiles(home, away, prof)
+    pbtts = prob_btts(lh, la)
+    pover25 = prob_over_25(lh, la)
+    p1, px, p2 = prob_1x2(lh, la)
+
+    pick, pval, why = pick_recommendation(lh, la, p1, px, p2, pbtts, pover25)
+
+    # Social (kulcs nélkül)
+    social = {"gnews": [], "gdelt": [], "neg_hits": 0, "risk_penalty": 0.0}
+    if USE_GOOGLE_NEWS_RSS or USE_GDELT:
+        gnews_q, gdelt_q = build_social_query_pack(home, away)
+        try:
+            if USE_GOOGLE_NEWS_RSS:
+                gnews = google_news_rss(gnews_q, limit=SOCIAL_MAX_ITEMS)
+                if TRANSLATE_TO_HU:
+                    for x in gnews:
+                        x["title_hu"] = maybe_hu(x.get("title", ""))
+                social["gnews"] = gnews
+                social["neg_hits"] += sum(count_neg_hits(x.get("title", "")) for x in gnews)
+
+            if USE_GDELT:
+                garts = gdelt_doc(gdelt_q, maxrecords=SOCIAL_MAX_ITEMS)
+                if TRANSLATE_TO_HU:
+                    for x in garts:
+                        x["title_hu"] = maybe_hu(x.get("title", ""))
+                social["gdelt"] = garts
+                for a in garts:
+                    social["neg_hits"] += count_neg_hits(a.get("title", ""))
+                    tone = a.get("tone")
+                    if isinstance(tone, (int, float)) and tone < -4:
+                        social["neg_hits"] += 1
+        except Exception:
+            # ha bármi hiba jön a social lekérések közben, ne omoljon össze az app
+            pass
+
+    spen = social_penalty(int(social["neg_hits"] or 0))
+    social["risk_penalty"] = spen
+
+    conf_adj = clamp(pval - spen, 0.0, 1.0)
+    risk_label, risk_class = label_risk(n_home, n_away, extra_penalty=spen)
+
+    summary_lines = [
+        f"**xG várható gól:** {home} `{lh:.2f}` • {away} `{la:.2f}` • össz `{(lh+la):.2f}`",
+        f"**Piac esélyek:** BTTS `{pbtts*100:.0f}%` • Over2.5 `{pover25*100:.0f}%` • 1/X/2 `{p1*100:.0f}/{px*100:.0f}/{p2*100:.0f}%`",
+        f"**Ajánlás:** **{pick}** • alapesély `{pval*100:.0f}%` → korrigált `{conf_adj*100:.0f}%`",
+        f"**Rizikó:** **{risk_label}** • adat: (H `{n_home}` / A `{n_away}`)",
+    ]
+    if spen > 0:
+        summary_lines.append(f"🧠 **Hír/narratíva penalty:** −{spen*100:.0f}% (neg találat: {social['neg_hits']})")
+
+    signals = []
+    if spen > 0: signals.append("🧠 News/Sentiment")
+    signals.append("🧱 Data")
+
+    return {
+        "league_key": league_key,
+        "league": league_name,
+        "season": season,
+        "home": home,
+        "away": away,
+        "kickoff": kickoff_dt,
+        "kickoff_str": fmt_local(kickoff_dt),
+        "match_id": stable_match_id(league_key, kickoff_dt, home, away),
+        "lh": lh, "la": la,
+        "pick": pick,
+        "confidence_raw": pval,
+        "confidence": conf_adj,
+        "reliability": compute_reliability(conf_adj),
+        "risk_label": risk_label,
+        "risk_class": risk_class,
+        "social": social,
+        "social_penalty": spen,
+        "signals": signals,
+        "why": why,
+        "summary": "\n".join(summary_lines),
+        "quality_home": n_home,
+        "quality_away": n_away,
+    }
+
+# =========================================================
+#  MAIN
+# =========================================================
+season = season_from_today()
+
+# státusz sor
+status_pills = [
+    "Understat ✅",
+    "RSS ✅" if USE_GOOGLE_NEWS_RSS else "RSS —",
+    "GDELT ✅" if USE_GDELT else "GDELT —",
+    "HU fordítás ✅" if TRANSLATE_TO_HU else "HU fordítás —",
+]
+st.markdown(
+    f"""
+<div class="row">
+  <div class="pill">⏱️ Frissítve: <b>{datetime.now().astimezone().strftime('%Y.%m.%d %H:%M')}</b></div>
+  <div class="row">
+    {"".join([f'<div class="pill">{p}</div>' for p in status_pills])}
+  </div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+# utóellenőrzés (ha van log)
+logdf, updated_n = verify_log_outcomes()
+if updated_n > 0:
+    st.success(f"Utóellenőrzés: {updated_n} mentett tipp frissítve eredménnyel.")
+
+rows = []
+errors = []
+
+with st.spinner("Autonóm elemzés: Understat xG + rangadó/derby kizárás + hírek fordítása…"):
+    for lk, league_name in LEAGUES.items():
+        try:
+            fixtures, results = understat_fetch(lk, season, DAYS_AHEAD)
+        except Exception as e:
+            errors.append(f"{league_name}: {e}")
+            continue
+
+        prof = build_team_xg_profiles(results)
+
+        for m in fixtures:
+            home = clean_team(((m.get("h") or {}).get("title")))
+            away = clean_team(((m.get("a") or {}).get("title")))
+            kickoff = parse_dt(m.get("datetime", ""))
+
+            if not home or not away or not kickoff:
+                continue
+
+            # --- Derby / rival exclusion ---
+            if is_excluded_match(lk, home, away):
+                continue
+
+            rows.append(build_match_analysis(lk, league_name, season, home, away, kickoff, prof))
+
+if errors:
+    st.warning("Néhány liga hibával tért vissza:\n\n" + "\n".join([f"• {x}" for x in errors]))
+
+if not rows:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown("Nincs ajánlható meccs az időablakban (derby/rangadók kizárva).")
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.stop()
+
+df = pd.DataFrame(rows).sort_values(by=["confidence", "kickoff"], ascending=[False, True]).reset_index(drop=True)
+top2 = df.head(TOP_K).copy()
+
+# automatikus logolás TOP 2
+if AUTO_LOG_TOP_PICKS and not top2.empty:
+    log_rows = []
+    for _, r in top2.iterrows():
+        log_rows.append({
+            "logged_utc": now_utc().isoformat(),
+            "league_key": r["league_key"],
+            "league": r["league"],
+            "season": int(r["season"]),
+            "match_id": r["match_id"],
+            "kickoff_utc": r["kickoff"].isoformat(),
+            "kickoff_local": r["kickoff_str"],
+            "home": r["home"],
+            "away": r["away"],
+            "pick": r["pick"],
+            "confidence": float(r["confidence"]),
+            "risk_label": r["risk_label"],
+            "social_neg_hits": int((r["social"] or {}).get("neg_hits", 0)),
+            "social_penalty": float(r.get("social_penalty", 0.0)),
+            "result_home": "",
+            "result_away": "",
+            "outcome": "UNKNOWN",
+        })
+    append_log_rows(log_rows)
+
+# dashboard stats
+st.markdown("<hr/>", unsafe_allow_html=True)
+
+resolved = pd.DataFrame()
+if not logdf.empty and "outcome" in logdf.columns:
+    resolved = logdf[logdf["outcome"].isin(["WIN", "LOSS", "PUSH"])]
+
+wins = int((resolved["outcome"] == "WIN").sum()) if not resolved.empty else 0
+loss = int((resolved["outcome"] == "LOSS").sum()) if not resolved.empty else 0
+push = int((resolved["outcome"] == "PUSH").sum()) if not resolved.empty else 0
+total_res = wins + loss + push
+winrate = (wins / total_res * 100) if total_res > 0 else 0.0
+
+c1, c2, c3, c4 = st.columns(4)
+with c1: st.metric("Közelgő meccsek", int(len(df)))
+with c2: st.metric("TOP pickek", TOP_K)
+with c3: st.metric("Lezárt tippek", total_res)
+with c4: st.metric("Winrate", f"{winrate:.1f}%")
+
+# TOP 2 kártyák
+st.markdown('<div class="panel">', unsafe_allow_html=True)
+st.subheader("🎯 A két legjobb választás (autonóm)")
+
+for idx, r in top2.iterrows():
+    rel = int(r["reliability"])
+    signals = " ".join([f"<span class='signal'>{s}</span>" for s in r["signals"]])
+
+    # top 3 hír (magyar)
+    extra_lines = []
+    if SHOW_SOCIAL_DETAILS and isinstance(r.get("social"), dict):
+        gnews = (r["social"] or {}).get("gnews", []) or []
+        gd = (r["social"] or {}).get("gdelt", []) or []
+        # google news 2 db
+        for x in gnews[:2]:
+            t = x.get("title_hu") if TRANSLATE_TO_HU else x.get("title")
+            if t:
+                extra_lines.append(f"• {t}")
+        # gdelt 1 db
+        for x in gd[:1]:
+            t = x.get("title_hu") if TRANSLATE_TO_HU else x.get("title")
+            if t:
+                extra_lines.append(f"• {t}")
+
+    extra_html = ""
+    if extra_lines and r.get("social_penalty", 0.0) > 0:
+        extra_html = "<div class='small' style='margin-top:8px; white-space:pre-wrap;'>" + "\n".join(extra_lines) + "</div>"
+
+    st.markdown(
+        f"""
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+    <div class="pill"><b>#{idx+1}</b> • <span class="small">{r['league']}</span> • Kezdés: <b>{r['kickoff_str']}</b></div>
+    <div class="pill {r['risk_class']}"><b>{r['risk_label']}</b> • Megbízhatóság: <b>{rel}%</b></div>
+  </div>
+
+  <h3 style="margin:0.45rem 0 0.35rem 0;">{r['home']} vs {r['away']}</h3>
+
+  <div class="grid">
+    <div class="metricbox"><div class="mtitle">Ajánlás</div><div class="mval">{r['pick']}</div></div>
+    <div class="metricbox"><div class="mtitle">Valószínűség</div><div class="mval">{r['confidence']*100:.0f}%</div></div>
+    <div class="metricbox"><div class="mtitle">Össz xG</div><div class="mval">{(r['lh']+r['la']):.2f}</div></div>
+  </div>
+
+  <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
+    {signals}
+  </div>
+
+  <details style="margin-top:10px;">
+    <summary style="cursor:pointer;color:rgba(255,255,255,0.84);">Miért ezt?</summary>
+    <div style="margin-top:8px; white-space:pre-wrap;">{r['summary']}</div>
+    {extra_html}
+  </details>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+# Backtest panel
+st.markdown('<div class="panel">', unsafe_allow_html=True)
+st.subheader("🧾 Backtest / Utóellenőrzés (mentett tippek)")
+
+left, right = st.columns([1, 1])
+with left:
+    st.write(f"Mentett tippek: **{len(logdf)}**")
+    st.write(f"Lezárt: **{total_res}** • WIN: **{wins}** • LOSS: **{loss}** • PUSH: **{push}**")
+with right:
+    if st.button("🔁 Eredmények újraellenőrzése", use_container_width=True):
+        df2, n2 = verify_log_outcomes()
+        st.success(f"Frissítve: {n2} tipp.")
+        logdf = df2
+
+if not logdf.empty:
+    view = logdf.sort_values(by=["logged_utc"], ascending=False).head(15)
+    st.dataframe(view, use_container_width=True, hide_index=True)
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+st.caption("Derby/rangadó kizárás aktív. Ha még több párosítást akarsz tiltani, az EXCLUDED_MATCHUPS listát bővítsd.")
