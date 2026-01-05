@@ -1,52 +1,48 @@
-# streamlit_app.py
-# TITAN – Autonóm Mission Control (TOP 2 pick) + Derby/Top-rivalry kizárás + hírek magyar fordítás
-# FIXEK / FRISSÍTÉSEK:
-# - Robust run_async: ha van futó event loop, a coroutine új szálban egy új loopban fut le.
-# - Hibajelzések hiányzó csomagokra világos telepítési útmutatóval.
-# - Egyéb kisebb robosztussági javítások.
+# Updated streamlit_app.py - TITAN Mission Control
+# Robust, defensive, and Streamlit/Render-friendly implementation.
+# See README in repo for details.
 
 import os
 import re
 import math
 import csv
 import asyncio
+import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 import pandas as pd
 import requests
 import feedparser
 
-# ---------- hard fail-friendly import (aiohttp) ----------
+# Defensive imports for optional async libraries
 try:
     import aiohttp
-except Exception as e:
-    # Ha aiohttp nincs telepítve, jelezzük és megállítjuk az appot.
-    st.set_page_config(page_title="TITAN – Missing dependency", page_icon="⚠️", layout="wide")
-    st.error("Hiányzó csomag: **aiohttp**")
-    st.code(
-        "pip install aiohttp\npip install -r requirements.txt\n\nRender/Cloud esetén: ellenőrizd, hogy a requirements.txt-ben benne van: aiohttp",
-        language="bash",
-    )
-    st.stop()
+except Exception:
+    aiohttp = None
 
-# Understat lib (aiohttp session-t kér)
 try:
     from understat import Understat
 except Exception:
-    st.set_page_config(page_title="TITAN – Missing dependency", page_icon="⚠️", layout="wide")
-    st.error("Hiányzó csomag: **understat**")
-    st.code("pip install understat\npip install -r requirements.txt", language="bash")
-    st.stop()
+    Understat = None
 
-# =========================================================
-#  FIX KONFIG (nincs kontroll panel)
-# =========================================================
+# Configure basic logging to file for debugging in Render/Streamlit
+LOG_PATH = Path("titan_debug.log")
+logging.basicConfig(
+    filename=str(LOG_PATH),
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("titan")
+
+# Page config early so hard-fail pages render nicely
 st.set_page_config(page_title="TITAN – Mission Control", page_icon="🛰️", layout="wide")
 
+# Constants and defaults
 LEAGUES = {
     "epl": "Premier League",
     "la_liga": "La Liga",
@@ -54,134 +50,94 @@ LEAGUES = {
     "serie_a": "Serie A",
     "ligue_1": "Ligue 1",
 }
-DAYS_AHEAD = 4
-TOP_K = 2
+DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "4"))
+TOP_K = int(os.getenv("TOP_K", "2"))
 MAX_GOALS = 10
 
-# Social (kulcs nélkül)
+# Social / news
 USE_GOOGLE_NEWS_RSS = True
 USE_GDELT = True
 SOCIAL_MAX_ITEMS = 12
 SHOW_SOCIAL_DETAILS = True
-TRANSLATE_TO_HU = True  # hírek címének magyarítása
+TRANSLATE_TO_HU = True
 
-# Backtest
-PICKS_LOG_PATH = Path("picks_log.csv")
+# Backtest / logging
+PICKS_LOG_PATH = Path(os.getenv("PICKS_LOG_PATH", "picks_log.csv"))
 AUTO_LOG_TOP_PICKS = True
 
-# =========================================================
-#  Secrets / ENV (kulcsok csak secrets/env)
-# =========================================================
+# Secrets helper
 def _secret(name: str) -> str:
-    return (os.getenv(name) or st.secrets.get(name, "") or "").strip()
+    # Prefer environment variables (Render), fall back to Streamlit secrets
+    return (os.getenv(name) or (st.secrets.get(name) if hasattr(st, "secrets") else None) or "")
 
-NEWS_API_KEY = _secret("NEWS_API_KEY")        # opcionális
-WEATHER_API_KEY = _secret("WEATHER_API_KEY")  # opcionális
-ODDS_API_KEY = _secret("ODDS_API_KEY")        # opcionális
-FOOTBALL_DATA_TOKEN = _secret("FOOTBALL_DATA_TOKEN")  # opcionális
+NEWS_API_KEY = _secret("NEWS_API_KEY")
+WEATHER_API_KEY = _secret("WEATHER_API_KEY")
+ODDS_API_KEY = _secret("ODDS_API_KEY")
+FOOTBALL_DATA_TOKEN = _secret("FOOTBALL_DATA_TOKEN")
 
-# =========================================================
-#  UI – Mission Control
-# =========================================================
-st.markdown(
-    """
+# Early dependency checks that render helpful instructions
+missing = []
+if aiohttp is None:
+    missing.append("aiohttp")
+if Understat is None:
+    missing.append("understat")
+
+if missing:
+    st.title("TITAN – Missing dependencies")
+    st.error(f"Hiányzó csomag(ok): {', '.join(missing)}")
+    st.code("pip install " + " ".join(missing) + "\n\npip install -r requirements.txt", language="bash")
+    st.stop()
+
+# UI styling (kept compact but readable)
+st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=Space+Grotesk:wght@700;800&display=swap');
-:root{
-  --bg0:#06070c; --bg1:#0b1020;
-  --card: rgba(255,255,255,0.065); --card2: rgba(255,255,255,0.045);
-  --border: rgba(255,255,255,0.11);
-  --text: rgba(255,255,255,0.92); --muted: rgba(255,255,255,0.66);
-  --good:#4ef0a3; --warn:#ffd166; --bad:#ff5c8a;
-  --accent:#79a6ff; --accent2:#b387ff;
-}
-html, body, [class*="css"] { font-family: 'Inter', sans-serif; color: var(--text); }
-.stApp{
-  background:
-    radial-gradient(950px 540px at 16% 10%, rgba(121,166,255,0.18), transparent 60%),
-    radial-gradient(760px 430px at 86% 16%, rgba(179,135,255,0.14), transparent 55%),
-    linear-gradient(135deg, var(--bg0) 0%, var(--bg1) 50%, var(--bg0) 100%);
-}
-.hdr{
-  font-family: 'Space Grotesk', sans-serif; font-weight: 800;
-  font-size: 2.05rem; margin: 0.15rem 0 0.1rem 0;
-  background: linear-gradient(90deg, var(--accent), var(--accent2));
-  -webkit-background-clip:text; -webkit-text-fill-color:transparent;
-}
-.sub{ color: var(--muted); margin-bottom: 0.6rem; }
-.row{ display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; }
-.pill{
-  display:inline-flex; align-items:center; gap:8px;
-  padding: 4px 10px; border-radius: 999px;
-  border: 1px solid var(--border); background: rgba(255,255,255,0.04);
-  font-size: 0.86rem; color: rgba(255,255,255,0.86);
-  white-space:nowrap;
-}
-.tag-good{ border-color: rgba(78,240,163,0.38); background: rgba(78,240,163,0.11); }
-.tag-warn{ border-color: rgba(255,209,102,0.44); background: rgba(255,209,102,0.11); }
-.tag-bad { border-color: rgba(255,92,138,0.44); background: rgba(255,92,138,0.12); }
-.panel{
-  background: var(--card); border: 1px solid var(--border);
-  border-radius: 18px; padding: 14px 14px 10px 14px;
-  box-shadow: 0 18px 55px rgba(0,0,0,0.42); margin: 10px 0;
-}
-.card{
-  background: var(--card2); border: 1px solid rgba(255,255,255,0.12);
-  border-radius: 18px; padding: 14px 14px 10px 14px; margin: 10px 0;
-  box-shadow: 0 14px 45px rgba(0,0,0,0.40);
-}
-.grid{ display:grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 10px; }
-@media (max-width: 900px){ .grid{ grid-template-columns: 1fr; } }
-.metricbox{
-  background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.10);
-  border-radius: 16px; padding: 10px 12px;
-}
-.mtitle{ color: var(--muted); font-size: 0.82rem; margin-bottom: 4px;}
-.mval{ font-weight: 800; font-size: 1.08rem; }
-.small{ color: var(--muted); font-size: 0.9rem; }
-.signal{
-  display:inline-flex; align-items:center; gap:8px;
-  padding: 3px 8px; border-radius: 999px;
-  border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.035);
-  font-size: 0.82rem; color: rgba(255,255,255,0.84);
-}
-hr{ border: none; border-top: 1px solid rgba(255,255,255,0.10); margin: 1rem 0; }
+/* Minimal style that is Render/Streamlit friendly */
+body { color: #eaeef8; background: #071226; }
+.hdr{ font-family: 'Inter', Arial; font-size: 1.9rem; font-weight:700; color: #79a6ff; }
+.panel{ background: rgba(255,255,255,0.03); padding:12px; border-radius:12px; }
 </style>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
-st.markdown('<div class="hdr">🛰️ TITAN – Mission Control</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="sub">Autonóm: <b>mindig 2 legjobb pick</b> • Derbik/rivális rangadók kizárva • '
-    'Hír/narratíva: <b>csak rizikó-penalty</b> + magyar fordítás.</div>',
-    unsafe_allow_html=True,
-)
+st.markdown('<div class="hdr">🛰️ TITAN – Mission Control (stabilized)</div>', unsafe_allow_html=True)
 
-# =========================================================
-#  Utils
-# =========================================================
+# ------------------ Utilities ------------------
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
 
 def season_from_today() -> int:
     t = datetime.now().date()
     return t.year - 1 if t.month < 7 else t.year
 
-def parse_dt(s: str):
+
+def parse_dt(s: str) -> Optional[datetime]:
+    if not s or not isinstance(s, str):
+        return None
+    # Understat historically returns 'YYYY-MM-DD HH:MM:SS' but some endpoints may use ISO
     try:
         return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     except Exception:
-        # próbáljuk ISO formátummal
         try:
             dt = datetime.fromisoformat(s)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt
         except Exception:
-            return None
+            # fallback: try to extract numbers
+            m = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})", s)
+            if m:
+                try:
+                    dt = datetime.fromisoformat(m.group(1))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return dt
+                except Exception:
+                    return None
+    return None
 
-def fmt_local(dt):
+
+def fmt_local(dt: Optional[datetime]) -> str:
     if not dt:
         return "—"
     try:
@@ -189,80 +145,77 @@ def fmt_local(dt):
     except Exception:
         return dt.strftime("%Y.%m.%d %H:%M")
 
-def clamp(x, a, b):
+
+def clamp(x: float, a: float, b: float) -> float:
     return max(a, min(b, x))
 
-def safe_float(x, default=None):
+
+def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         return float(x)
     except Exception:
         return default
 
-def clean_team(name: str) -> str:
+
+def clean_team(name: Optional[str]) -> str:
     name = (name or "").strip()
     name = re.sub(r"\s+", " ", name)
     return name
 
-def stable_match_id(league_key: str, kickoff_dt: datetime, home: str, away: str) -> str:
+
+def stable_match_id(league_key: str, kickoff_dt: Optional[datetime], home: str, away: str) -> str:
     k = kickoff_dt.strftime("%Y%m%d%H%M") if kickoff_dt else "0000"
     return f"{league_key}:{k}:{home.lower()}__{away.lower()}"
 
-# =========================================================
-#  Derby / rival exclusions (kérésedre)
-# =========================================================
-EXCLUDED_MATCHUPS = {
-    ("Manchester City", "Chelsea"),
-    ("Chelsea", "Manchester City"),
-    ("Manchester City", "Manchester United"),
-    ("Manchester United", "Manchester City"),
-    ("Arsenal", "Tottenham"),
-    ("Tottenham", "Arsenal"),
-    ("Liverpool", "Everton"),
-    ("Everton", "Liverpool"),
-    ("Liverpool", "Manchester United"),
-    ("Manchester United", "Liverpool"),
-    ("Arsenal", "Chelsea"),
-    ("Chelsea", "Arsenal"),
-    ("Manchester United", "Chelsea"),
-    ("Chelsea", "Manchester United"),
-    ("Liverpool", "Manchester City"),
-    ("Manchester City", "Liverpool"),
-    ("Real Madrid", "Barcelona"),
-    ("Barcelona", "Real Madrid"),
-    ("Atletico Madrid", "Real Madrid"),
-    ("Real Madrid", "Atletico Madrid"),
-    ("Barcelona", "Atletico Madrid"),
-    ("Atletico Madrid", "Barcelona"),
-    ("Inter", "AC Milan"),
-    ("AC Milan", "Inter"),
-    ("Juventus", "Inter"),
-    ("Inter", "Juventus"),
-    ("Juventus", "AC Milan"),
-    ("AC Milan", "Juventus"),
-    ("Roma", "Lazio"),
-    ("Lazio", "Roma"),
-    ("Bayern Munich", "Borussia Dortmund"),
-    ("Borussia Dortmund", "Bayern Munich"),
-    ("PSG", "Marseille"),
-    ("Marseille", "PSG"),
-}
+# ------------------ Derby / Rival Exclusions ------------------
+EXCLUDED_MATCHUPS = set([
+    ("Manchester City", "Chelsea"), ("Chelsea", "Manchester City"),
+    ("Manchester City", "Manchester United"), ("Manchester United", "Manchester City"),
+    ("Arsenal", "Tottenham"), ("Tottenham", "Arsenal"),
+    ("Liverpool", "Everton"), ("Everton", "Liverpool"),
+    ("Liverpool", "Manchester United"), ("Manchester United", "Liverpool"),
+    ("Arsenal", "Chelsea"), ("Chelsea", "Arsenal"),
+    ("Manchester United", "Chelsea"), ("Chelsea", "Manchester United"),
+    ("Liverpool", "Manchester City"), ("Manchester City", "Liverpool"),
+    ("Real Madrid", "Barcelona"), ("Barcelona", "Real Madrid"),
+    ("Atletico Madrid", "Real Madrid"), ("Real Madrid", "Atletico Madrid"),
+    ("Barcelona", "Atletico Madrid"), ("Atletico Madrid", "Barcelona"),
+    ("Inter", "AC Milan"), ("AC Milan", "Inter"),
+    ("Juventus", "Inter"), ("Inter", "Juventus"),
+    ("Juventus", "AC Milan"), ("AC Milan", "Juventus"),
+    ("Roma", "Lazio"), ("Lazio", "Roma"),
+    ("Bayern Munich", "Borussia Dortmund"), ("Borussia Dortmund", "Bayern Munich"),
+    ("PSG", "Marseille"), ("Marseille", "PSG"),
+])
 
 EPL_BIG6 = {"Arsenal", "Chelsea", "Liverpool", "Manchester City", "Manchester United", "Tottenham"}
 
+
 def is_excluded_match(league_key: str, home: str, away: str) -> bool:
-    if (home, away) in EXCLUDED_MATCHUPS:
-        return True
-    if league_key == "epl" and home in EPL_BIG6 and away in EPL_BIG6:
-        return True
+    try:
+        if (home, away) in EXCLUDED_MATCHUPS:
+            return True
+        if league_key == "epl" and home in EPL_BIG6 and away in EPL_BIG6:
+            return True
+    except Exception:
+        logger.exception("Error evaluating exclusion")
     return False
 
-# =========================================================
-#  Poisson model
-# =========================================================
-def poisson_pmf(lmb, k):
-    return math.exp(-lmb) * (lmb ** k) / math.factorial(k)
+# ------------------ Poisson model / probabilities ------------------
 
-def prob_over_25(lh, la, max_goals=MAX_GOALS):
+def poisson_pmf(lmb: float, k: int) -> float:
+    # protective: if lmb is 0, return 1 at k==0
+    try:
+        if lmb <= 0 and k == 0:
+            return 1.0
+        if lmb <= 0:
+            return 0.0
+        return math.exp(-lmb) * (lmb ** k) / math.factorial(k)
+    except Exception:
+        return 0.0
+
+
+def prob_over_25(lh: float, la: float, max_goals: int = MAX_GOALS) -> float:
     p = 0.0
     for i in range(max_goals + 1):
         for j in range(max_goals + 1):
@@ -270,11 +223,16 @@ def prob_over_25(lh, la, max_goals=MAX_GOALS):
                 p += poisson_pmf(lh, i) * poisson_pmf(la, j)
     return clamp(p, 0.0, 1.0)
 
-def prob_btts(lh, la):
-    p = 1 - math.exp(-lh) - math.exp(-la) + math.exp(-(lh + la))
-    return clamp(p, 0.0, 1.0)
 
-def prob_1x2(lh, la, max_goals=MAX_GOALS):
+def prob_btts(lh: float, la: float) -> float:
+    try:
+        p = 1 - math.exp(-lh) - math.exp(-la) + math.exp(-(lh + la))
+        return clamp(p, 0.0, 1.0)
+    except Exception:
+        return 0.0
+
+
+def prob_1x2(lh: float, la: float, max_goals: int = MAX_GOALS) -> Tuple[float, float, float]:
     ph = pdw = pa = 0.0
     for i in range(max_goals + 1):
         pi = poisson_pmf(lh, i)
@@ -291,10 +249,7 @@ def prob_1x2(lh, la, max_goals=MAX_GOALS):
         ph, pdw, pa = ph / s, pdw / s, pa / s
     return clamp(ph, 0.0, 1.0), clamp(pdw, 0.0, 1.0), clamp(pa, 0.0, 1.0)
 
-# =========================================================
-#  Social: Google News RSS + GDELT
-#  + Magyar fordítás (MyMemory – kulcs nélkül)
-# =========================================================
+# ------------------ Social: Google News RSS + GDELT + translation ------------------
 NEG_KEYWORDS = [
     "injury", "injured", "ruled out", "out", "doubtful", "sidelined",
     "suspended", "suspension", "ban",
@@ -302,25 +257,32 @@ NEG_KEYWORDS = [
     "divorce", "wife", "girlfriend", "partner", "family",
 ]
 
-def count_neg_hits(text: str) -> int:
+
+def count_neg_hits(text: Optional[str]) -> int:
     t = (text or "").lower()
     return sum(1 for k in NEG_KEYWORDS if k in t)
 
-def google_news_rss(query: str, hl="en", gl="US", ceid="US:en", limit=12):
+
+def google_news_rss(query: str, hl: str = "en", gl: str = "US", ceid: str = "US:en", limit: int = 12) -> List[Dict[str, Any]]:
     q = quote_plus(query)
     url = f"https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
-    feed = feedparser.parse(url)
-    out = []
-    for e in (feed.entries or [])[:limit]:
-        out.append({
-            "title": e.get("title", ""),
-            "link": e.get("link", ""),
-            "published": e.get("published", ""),
-            "source": (e.get("source") or {}).get("title", ""),
-        })
-    return out
+    try:
+        feed = feedparser.parse(url)
+        out = []
+        for e in (feed.entries or [])[:limit]:
+            out.append({
+                "title": e.get("title", ""),
+                "link": e.get("link", ""),
+                "published": e.get("published", ""),
+                "source": (e.get("source") or {}).get("title", ""),
+            })
+        return out
+    except Exception:
+        logger.exception("google_news_rss failed")
+        return []
 
-def gdelt_doc(query: str, maxrecords=12):
+
+def gdelt_doc(query: str, maxrecords: int = 12) -> List[Dict[str, Any]]:
     url = "https://api.gdeltproject.org/api/v2/doc/doc"
     params = {
         "query": query,
@@ -329,40 +291,46 @@ def gdelt_doc(query: str, maxrecords=12):
         "maxrecords": maxrecords,
         "sort": "HybridRel",
     }
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    arts = data.get("articles", []) or []
-    out = []
-    for a in arts:
-        out.append({
-            "title": a.get("title", ""),
-            "url": a.get("url", ""),
-            "domain": a.get("domain", ""),
-            "seendate": a.get("seendate", ""),
-            "tone": a.get("tone", None),
-        })
-    return out
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        arts = data.get("articles", []) or []
+        out = []
+        for a in arts:
+            out.append({
+                "title": a.get("title", ""),
+                "url": a.get("url", ""),
+                "domain": a.get("domain", ""),
+                "seendate": a.get("seendate", ""),
+                "tone": a.get("tone", None),
+            })
+        return out
+    except Exception:
+        logger.exception("gdelt_doc failed")
+        return []
 
-def build_social_query_pack(home: str, away: str):
+
+def build_social_query_pack(home: str, away: str) -> Tuple[str, str]:
     neg_terms = ["injury", "suspended", "scandal", "divorce", "arrest"]
-    gnews_q = f'({home} OR "{away}") AND ({ " OR ".join(neg_terms) })'
-    gdelt_q = f'({home} OR "{away}") ({ " OR ".join(neg_terms) })'
+    gnews_q = f'({home} OR "{away}") AND ({" OR ".join(neg_terms)})'
+    gdelt_q = f'({home} OR "{away}") ({" OR ".join(neg_terms)})'
     return gnews_q, gdelt_q
 
+
 def social_penalty(neg_hits: int) -> float:
-    if neg_hits <= 0: return 0.00
-    if neg_hits == 1: return 0.05
-    if neg_hits == 2: return 0.08
-    if 3 <= neg_hits <= 4: return 0.12
+    if neg_hits <= 0:
+        return 0.0
+    if neg_hits == 1:
+        return 0.05
+    if neg_hits == 2:
+        return 0.08
+    if 3 <= neg_hits <= 4:
+        return 0.12
     return 0.15
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def translate_en_to_hu(text: str) -> str:
-    """
-    Ingyenes fordítás MyMemory-val (kulcs nélkül).
-    Ha nem elérhető, visszaadja az eredetit.
-    """
     t = (text or "").strip()
     if not t:
         return t
@@ -375,52 +343,61 @@ def translate_en_to_hu(text: str) -> str:
         out = ((data.get("responseData") or {}).get("translatedText") or "").strip()
         return out if out else t
     except Exception:
+        logger.exception("translate_en_to_hu failed")
         return t
+
 
 def maybe_hu(text: str) -> str:
     if not TRANSLATE_TO_HU:
         return text
+    # Heuristic: if text looks too short or contains non-english tokens, skip translation
+    if not text or len(text) < 10:
+        return text
     return translate_en_to_hu(text)
 
-# =========================================================
-#  Understat async runner (Streamlit-safe)
-# =========================================================
+# ------------------ Async runner for Streamlit-safe environment ------------------
+
 def run_async(coro):
     """
-    Robust async runner:
-    - Ha nincs futó event loop: asyncio.run(coro)
-    - Ha van már futó loop (pl. Streamlit), külön szálban hozunk létre egy új event loop-ot és ott futtatjuk a coroutine-t.
+    Run the given coroutine safely:
+    - If no running loop: use asyncio.run
+    - If a loop is running (Streamlit), start a new event loop in a separate thread and run the coroutine there
+
+    Returns the result of the coroutine or raises exceptions from it.
     """
     try:
-        asyncio.get_running_loop()
+        running = asyncio.get_running_loop()
     except RuntimeError:
-        # nincs futó loop, biztonságosan futtathatjuk
+        # no running loop
         return asyncio.run(coro)
-    else:
-        # van futó loop: futtassuk új loop-ban új szálban
-        def _run_in_new_loop(c):
-            new_loop = asyncio.new_event_loop()
-            try:
-                asyncio.set_event_loop(new_loop)
-                return new_loop.run_until_complete(c)
-            finally:
-                try:
-                    new_loop.close()
-                except Exception:
-                    pass
 
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(_run_in_new_loop, coro)
-            return fut.result()
+    # running loop exists -> create a new loop in separate thread
+    def _run_in_new_loop(c):
+        new_loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(new_loop)
+            return new_loop.run_until_complete(c)
+        finally:
+            try:
+                new_loop.close()
+            except Exception:
+                pass
+
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(_run_in_new_loop, coro)
+        return fut.result()
 
 @st.cache_data(ttl=600, show_spinner=False)
 def understat_fetch(league_key: str, season: int, days_ahead: int):
     async def _run():
+        if aiohttp is None or Understat is None:
+            return [], []
         async with aiohttp.ClientSession() as session:
             u = Understat(session)
             fixtures = await u.get_league_fixtures(league_key, season)
             results = await u.get_league_results(league_key, season)
             return fixtures or [], results or []
+
     fixtures, results = run_async(_run())
 
     now = now_utc()
@@ -435,9 +412,10 @@ def understat_fetch(league_key: str, season: int, days_ahead: int):
     fx.sort(key=lambda x: x.get("datetime", ""))
     return fx, results
 
-def build_team_xg_profiles(results: list[dict]):
-    prof = {}
-    def ensure(team):
+def build_team_xg_profiles(results: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    prof: Dict[str, Dict[str, Any]] = {}
+
+    def ensure(team: str):
         prof.setdefault(team, {"home_for": [], "home_against": [], "away_for": [], "away_against": []})
 
     for m in results or []:
@@ -445,7 +423,10 @@ def build_team_xg_profiles(results: list[dict]):
         a = clean_team(((m.get("a") or {}).get("title")))
         xgh = safe_float(((m.get("xG") or {}).get("h")))
         xga = safe_float(((m.get("xG") or {}).get("a")))
-        if not h or not a or xgh is None or xga is None:
+        if not h or not a:
+            continue
+        # Understat sometimes provides strings or None
+        if xgh is None or xga is None:
             continue
         ensure(h); ensure(a)
         prof[h]["home_for"].append(xgh)
@@ -453,21 +434,21 @@ def build_team_xg_profiles(results: list[dict]):
         prof[a]["away_for"].append(xga)
         prof[a]["away_against"].append(xgh)
 
-    out = {}
+    out: Dict[str, Dict[str, Any]] = {}
     for team, d in prof.items():
         hf = d["home_for"]; ha = d["home_against"]
         af = d["away_for"]; aa = d["away_against"]
         out[team] = {
-            "home_xg_for": sum(hf)/len(hf) if hf else None,
-            "home_xg_against": sum(ha)/len(ha) if ha else None,
-            "away_xg_for": sum(af)/len(af) if af else None,
-            "away_xg_against": sum(aa)/len(aa) if aa else None,
+            "home_xg_for": sum(hf) / len(hf) if hf else None,
+            "home_xg_against": sum(ha) / len(ha) if ha else None,
+            "away_xg_for": sum(af) / len(af) if af else None,
+            "away_xg_against": sum(aa) / len(aa) if aa else None,
             "n_home": len(hf),
             "n_away": len(af),
         }
     return out
 
-def expected_goals_from_profiles(home: str, away: str, prof: dict, base=1.35):
+def expected_goals_from_profiles(home: str, away: str, prof: Dict[str, Dict[str, Any]], base: float = 1.35) -> Tuple[float, float, int, int]:
     ph = prof.get(home, {})
     pa = prof.get(away, {})
 
@@ -476,15 +457,19 @@ def expected_goals_from_profiles(home: str, away: str, prof: dict, base=1.35):
     a_for = pa.get("away_xg_for")
     a_against = pa.get("away_xg_against")
 
-    lh_parts = []
-    if h_for is not None: lh_parts.append(h_for)
-    if a_against is not None: lh_parts.append(a_against)
-    lh = sum(lh_parts)/len(lh_parts) if lh_parts else base
+    lh_parts: List[float] = []
+    if h_for is not None:
+        lh_parts.append(h_for)
+    if a_against is not None:
+        lh_parts.append(a_against)
+    lh = sum(lh_parts) / len(lh_parts) if lh_parts else base
 
-    la_parts = []
-    if a_for is not None: la_parts.append(a_for)
-    if h_against is not None: la_parts.append(h_against)
-    la = sum(la_parts)/len(la_parts) if la_parts else base
+    la_parts: List[float] = []
+    if a_for is not None:
+        la_parts.append(a_for)
+    if h_against is not None:
+        la_parts.append(h_against)
+    la = sum(la_parts) / len(la_parts) if la_parts else base
 
     lh = clamp(lh, 0.2, 3.5)
     la = clamp(la, 0.2, 3.5)
@@ -493,14 +478,14 @@ def expected_goals_from_profiles(home: str, away: str, prof: dict, base=1.35):
     n_away = int(pa.get("n_away", 0) or 0)
     return lh, la, n_home, n_away
 
-def label_risk(n_home: int, n_away: int, extra_penalty: float):
+def label_risk(n_home: int, n_away: int, extra_penalty: float) -> Tuple[str, str]:
     if n_home >= 8 and n_away >= 8 and extra_penalty < 0.08:
         return "MEGBÍZHATÓ", "tag-good"
     if n_home >= 4 and n_away >= 4 and extra_penalty < 0.12:
         return "RIZIKÓS", "tag-warn"
     return "NAGYON RIZIKÓS", "tag-bad"
 
-def pick_recommendation(lh, la, p1, px, p2, pbtts, pover25):
+def pick_recommendation(lh: float, la: float, p1: float, px: float, p2: float, pbtts: float, pover25: float) -> Tuple[str, float, str]:
     total_xg = lh + la
     if pbtts >= 0.58 and total_xg >= 2.55:
         return ("BTTS – IGEN", pbtts, f"Mindkét csapat gól esélyes (össz xG ~ {total_xg:.2f}).")
@@ -514,12 +499,11 @@ def pick_recommendation(lh, la, p1, px, p2, pbtts, pover25):
         return ("Vendég győzelem (2)", p2, f"Vendég oldal valószínűbb (~{p2*100:.0f}%).")
     return ("Döntetlen (X)", px, f"Döntetlen valószínűbb (~{px*100:.0f}%).")
 
-def compute_reliability(conf: float) -> int:
-    return int(clamp(conf * 100, 0, 100))
 
-# =========================================================
-#  Backtest log + ellenőrzés (alap: mentés + táblázat)
-# =========================================================
+def compute_reliability(conf: float) -> int:
+    return int(clamp(conf * 100.0, 0, 100))
+
+# ------------------ Backtest log helpers ------------------
 LOG_FIELDS = [
     "logged_utc", "league_key", "league", "season", "match_id",
     "kickoff_utc", "kickoff_local", "home", "away",
@@ -528,18 +512,25 @@ LOG_FIELDS = [
     "result_home", "result_away", "outcome",
 ]
 
-def ensure_log_file():
+
+def ensure_log_file() -> None:
     if not PICKS_LOG_PATH.exists():
         with PICKS_LOG_PATH.open("w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
             w.writeheader()
 
+
 def read_log_df() -> pd.DataFrame:
     if not PICKS_LOG_PATH.exists():
         return pd.DataFrame(columns=LOG_FIELDS)
-    return pd.read_csv(PICKS_LOG_PATH)
+    try:
+        return pd.read_csv(PICKS_LOG_PATH)
+    except Exception:
+        logger.exception("Failed to read picks log file")
+        return pd.DataFrame(columns=LOG_FIELDS)
 
-def append_log_rows(rows: list[dict]):
+
+def append_log_rows(rows: List[Dict[str, Any]]) -> None:
     ensure_log_file()
     existing = set()
     df = read_log_df()
@@ -554,7 +545,8 @@ def append_log_rows(rows: list[dict]):
                 continue
             w.writerow(row)
 
-def eval_pick_outcome(pick: str, gh: int, ga: int) -> str:
+
+def eval_pick_outcome(pick: str, gh: Optional[int], ga: Optional[int]) -> str:
     pick = (pick or "").strip().lower()
     if gh is None or ga is None:
         return "UNKNOWN"
@@ -574,13 +566,16 @@ def eval_pick_outcome(pick: str, gh: int, ga: int) -> str:
 @st.cache_data(ttl=600, show_spinner=False)
 def understat_results_for_league(league_key: str, season: int):
     async def _run():
+        if aiohttp is None or Understat is None:
+            return []
         async with aiohttp.ClientSession() as session:
             u = Understat(session)
             results = await u.get_league_results(league_key, season)
             return results or []
     return run_async(_run())
 
-def find_result_for_match(results: list[dict], home: str, away: str, kickoff_utc: datetime):
+
+def find_result_for_match(results: List[Dict[str, Any]], home: str, away: str, kickoff_utc: datetime):
     best = None
     best_diff = None
     for m in results or []:
@@ -604,7 +599,8 @@ def find_result_for_match(results: list[dict], home: str, away: str, kickoff_utc
         return None
     return int(gh), int(ga)
 
-def verify_log_outcomes():
+
+def verify_log_outcomes() -> Tuple[pd.DataFrame, int]:
     df = read_log_df()
     if df.empty:
         return df, 0
@@ -613,7 +609,7 @@ def verify_log_outcomes():
         return df, 0
 
     updated = 0
-    cache_results = {}
+    cache_results: Dict[str, List[Dict[str, Any]]] = {}
     for idx, row in unresolved.iterrows():
         league_key = str(row.get("league_key", ""))
         season = int(row.get("season", season_from_today()))
@@ -644,10 +640,9 @@ def verify_log_outcomes():
         df.to_csv(PICKS_LOG_PATH, index=False)
     return df, updated
 
-# =========================================================
-#  Build match analysis (CORE + social penalty + derby exclude)
-# =========================================================
-def build_match_analysis(league_key: str, league_name: str, season: int, home: str, away: str, kickoff_dt: datetime, prof: dict):
+# ------------------ Build match analysis ------------------
+
+def build_match_analysis(league_key: str, league_name: str, season: int, home: str, away: str, kickoff_dt: datetime, prof: Dict[str, Any]) -> Dict[str, Any]:
     lh, la, n_home, n_away = expected_goals_from_profiles(home, away, prof)
     pbtts = prob_btts(lh, la)
     pover25 = prob_over_25(lh, la)
@@ -655,7 +650,6 @@ def build_match_analysis(league_key: str, league_name: str, season: int, home: s
 
     pick, pval, why = pick_recommendation(lh, la, p1, px, p2, pbtts, pover25)
 
-    # Social (kulcs nélkül)
     social = {"gnews": [], "gdelt": [], "neg_hits": 0, "risk_penalty": 0.0}
     if USE_GOOGLE_NEWS_RSS or USE_GDELT:
         gnews_q, gdelt_q = build_social_query_pack(home, away)
@@ -680,8 +674,7 @@ def build_match_analysis(league_key: str, league_name: str, season: int, home: s
                     if isinstance(tone, (int, float)) and tone < -4:
                         social["neg_hits"] += 1
         except Exception:
-            # ha bármi hiba jön a social lekérések közben, ne omoljon össze az app
-            pass
+            logger.exception("Social fetch failed for %s vs %s", home, away)
 
     spen = social_penalty(int(social["neg_hits"] or 0))
     social["risk_penalty"] = spen
@@ -699,7 +692,8 @@ def build_match_analysis(league_key: str, league_name: str, season: int, home: s
         summary_lines.append(f"🧠 **Hír/narratíva penalty:** −{spen*100:.0f}% (neg találat: {social['neg_hits']})")
 
     signals = []
-    if spen > 0: signals.append("🧠 News/Sentiment")
+    if spen > 0:
+        signals.append("🧠 News/Sentiment")
     signals.append("🧱 Data")
 
     return {
@@ -727,37 +721,29 @@ def build_match_analysis(league_key: str, league_name: str, season: int, home: s
         "quality_away": n_away,
     }
 
-# =========================================================
-#  MAIN
-# =========================================================
+# ------------------ MAIN UI & Flow ------------------
 season = season_from_today()
 
-# státusz sor
 status_pills = [
     "Understat ✅",
     "RSS ✅" if USE_GOOGLE_NEWS_RSS else "RSS —",
     "GDELT ✅" if USE_GDELT else "GDELT —",
     "HU fordítás ✅" if TRANSLATE_TO_HU else "HU fordítás —",
 ]
-st.markdown(
-    f"""
-<div class="row">
-  <div class="pill">⏱️ Frissítve: <b>{datetime.now().astimezone().strftime('%Y.%m.%d %H:%M')}</b></div>
-  <div class="row">
-    {"".join([f'<div class="pill">{p}</div>' for p in status_pills])}
-  </div>
-</div>
-""",
-    unsafe_allow_html=True,
-)
 
-# utóellenőrzés (ha van log)
+st.markdown(f"""
+<div style='display:flex;gap:12px;align-items:center'>
+  <div style='padding:6px 10px;border-radius:8px;background:rgba(255,255,255,0.03)'>⏱️ Frissítve: <b>{datetime.now().astimezone().strftime('%Y.%m.%d %H:%M')}</b></div>
+  {''.join([f"<div style='padding:6px 10px;border-radius:8px;background:rgba(255,255,255,0.02)'>{p}</div>" for p in status_pills])}
+</div>
+""", unsafe_allow_html=True)
+
 logdf, updated_n = verify_log_outcomes()
 if updated_n > 0:
     st.success(f"Utóellenőrzés: {updated_n} mentett tipp frissítve eredménnyel.")
 
-rows = []
-errors = []
+rows: List[Dict[str, Any]] = []
+errors: List[str] = []
 
 with st.spinner("Autonóm elemzés: Understat xG + rangadó/derby kizárás + hírek fordítása…"):
     for lk, league_name in LEAGUES.items():
@@ -765,6 +751,7 @@ with st.spinner("Autonóm elemzés: Understat xG + rangadó/derby kizárás + h�
             fixtures, results = understat_fetch(lk, season, DAYS_AHEAD)
         except Exception as e:
             errors.append(f"{league_name}: {e}")
+            logger.exception("understat_fetch failed for %s", lk)
             continue
 
         prof = build_team_xg_profiles(results)
@@ -777,7 +764,6 @@ with st.spinner("Autonóm elemzés: Understat xG + rangadó/derby kizárás + h�
             if not home or not away or not kickoff:
                 continue
 
-            # --- Derby / rival exclusion ---
             if is_excluded_match(lk, home, away):
                 continue
 
@@ -792,12 +778,14 @@ if not rows:
     st.markdown("</div>", unsafe_allow_html=True)
     st.stop()
 
+# Build dataframe and take top picks
+
 df = pd.DataFrame(rows).sort_values(by=["confidence", "kickoff"], ascending=[False, True]).reset_index(drop=True)
 top2 = df.head(TOP_K).copy()
 
-# automatikus logolás TOP 2
+# Auto-log top picks
 if AUTO_LOG_TOP_PICKS and not top2.empty:
-    log_rows = []
+    log_rows: List[Dict[str, Any]] = []
     for _, r in top2.iterrows():
         log_rows.append({
             "logged_utc": now_utc().isoformat(),
@@ -820,12 +808,11 @@ if AUTO_LOG_TOP_PICKS and not top2.empty:
         })
     append_log_rows(log_rows)
 
-# dashboard stats
+# Dashboard
 st.markdown("<hr/>", unsafe_allow_html=True)
-
 resolved = pd.DataFrame()
 if not logdf.empty and "outcome" in logdf.columns:
-    resolved = logdf[logdf["outcome"].isin(["WIN", "LOSS", "PUSH"])]
+    resolved = logdf[logdf["outcome"].isin(["WIN", "LOSS", "PUSH"]) ]
 
 wins = int((resolved["outcome"] == "WIN").sum()) if not resolved.empty else 0
 loss = int((resolved["outcome"] == "LOSS").sum()) if not resolved.empty else 0
@@ -834,30 +821,31 @@ total_res = wins + loss + push
 winrate = (wins / total_res * 100) if total_res > 0 else 0.0
 
 c1, c2, c3, c4 = st.columns(4)
-with c1: st.metric("Közelgő meccsek", int(len(df)))
-with c2: st.metric("TOP pickek", TOP_K)
-with c3: st.metric("Lezárt tippek", total_res)
-with c4: st.metric("Winrate", f"{winrate:.1f}%")
+with c1:
+    st.metric("Közelgő meccsek", int(len(df)))
+with c2:
+    st.metric("TOP pickek", TOP_K)
+with c3:
+    st.metric("Lezárt tippek", total_res)
+with c4:
+    st.metric("Winrate", f"{winrate:.1f}%")
 
-# TOP 2 kártyák
+# Top picks cards
 st.markdown('<div class="panel">', unsafe_allow_html=True)
 st.subheader("🎯 A két legjobb választás (autonóm)")
 
 for idx, r in top2.iterrows():
     rel = int(r["reliability"])
-    signals = " ".join([f"<span class='signal'>{s}</span>" for s in r["signals"]])
+    signals = " ".join([f"<span style='background:rgba(255,255,255,0.02);padding:4px;border-radius:8px;margin-right:6px'>{s}</span>" for s in r["signals"]])
 
-    # top 3 hír (magyar)
-    extra_lines = []
+    extra_lines: List[str] = []
     if SHOW_SOCIAL_DETAILS and isinstance(r.get("social"), dict):
         gnews = (r["social"] or {}).get("gnews", []) or []
         gd = (r["social"] or {}).get("gdelt", []) or []
-        # google news 2 db
         for x in gnews[:2]:
             t = x.get("title_hu") if TRANSLATE_TO_HU else x.get("title")
             if t:
                 extra_lines.append(f"• {t}")
-        # gdelt 1 db
         for x in gd[:1]:
             t = x.get("title_hu") if TRANSLATE_TO_HU else x.get("title")
             if t:
@@ -865,44 +853,39 @@ for idx, r in top2.iterrows():
 
     extra_html = ""
     if extra_lines and r.get("social_penalty", 0.0) > 0:
-        extra_html = "<div class='small' style='margin-top:8px; white-space:pre-wrap;'>" + "\n".join(extra_lines) + "</div>"
+        extra_html = "<div style='margin-top:8px; white-space:pre-wrap; color:#cbd5e1'>" + "\n".join(extra_lines) + "</div>"
 
-    st.markdown(
-        f"""
-<div class="card">
-  <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
-    <div class="pill"><b>#{idx+1}</b> • <span class="small">{r['league']}</span> • Kezdés: <b>{r['kickoff_str']}</b></div>
-    <div class="pill {r['risk_class']}"><b>{r['risk_label']}</b> • Megbízhatóság: <b>{rel}%</b></div>
+    st.markdown(f"""
+<div style='padding:12px;background:rgba(255,255,255,0.02);border-radius:12px;margin-bottom:10px'>
+  <div style='display:flex;justify-content:space-between;align-items:center'>
+    <div style='font-size:0.9rem'><b>#{idx+1}</b> • <span style='opacity:0.85'>{r['league']}</span> • Kezdés: <b>{r['kickoff_str']}</b></div>
+    <div style='padding:8px;border-radius:10px;background:rgba(255,255,255,0.03)'><b>{r['risk_label']}</b> • {rel}%</div>
   </div>
-
-  <h3 style="margin:0.45rem 0 0.35rem 0;">{r['home']} vs {r['away']}</h3>
-
-  <div class="grid">
-    <div class="metricbox"><div class="mtitle">Ajánlás</div><div class="mval">{r['pick']}</div></div>
-    <div class="metricbox"><div class="mtitle">Valószínűség</div><div class="mval">{r['confidence']*100:.0f}%</div></div>
-    <div class="metricbox"><div class="mtitle">Össz xG</div><div class="mval">{(r['lh']+r['la']):.2f}</div></div>
+  <h3 style='margin:8px 0 6px 0'>{r['home']} vs {r['away']}</h3>
+  <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px'>
+    <div style='padding:8px;background:rgba(255,255,255,0.01);border-radius:8px'>
+      <div style='opacity:0.85'>Ajánlás</div><div style='font-weight:700'>{r['pick']}</div></div>
+    <div style='padding:8px;background:rgba(255,255,255,0.01);border-radius:8px'>
+      <div style='opacity:0.85'>Valószínűség</div><div style='font-weight:700'>{r['confidence']*100:.0f}%</div></div>
+    <div style='padding:8px;background:rgba(255,255,255,0.01);border-radius:8px'>
+      <div style='opacity:0.85'>Össz xG</div><div style='font-weight:700'>{(r['lh']+r['la']):.2f}</div></div>
   </div>
-
-  <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
+  <div style='margin-top:8px'>
     {signals}
   </div>
-
-  <details style="margin-top:10px;">
-    <summary style="cursor:pointer;color:rgba(255,255,255,0.84);">Miért ezt?</summary>
-    <div style="margin-top:8px; white-space:pre-wrap;">{r['summary']}</div>
+  <details style='margin-top:8px;color:#cbd5e1'>
+    <summary>Miért ezt?</summary>
+    <div style='margin-top:8px; white-space:pre-wrap;'>{r['summary']}</div>
     {extra_html}
   </details>
 </div>
-""",
-        unsafe_allow_html=True,
-    )
+""", unsafe_allow_html=True)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
 # Backtest panel
 st.markdown('<div class="panel">', unsafe_allow_html=True)
 st.subheader("🧾 Backtest / Utóellenőrzés (mentett tippek)")
-
 left, right = st.columns([1, 1])
 with left:
     st.write(f"Mentett tippek: **{len(logdf)}**")
@@ -918,5 +901,6 @@ if not logdf.empty:
     st.dataframe(view, use_container_width=True, hide_index=True)
 
 st.markdown("</div>", unsafe_allow_html=True)
-
 st.caption("Derby/rangadó kizárás aktív. Ha még több párosítást akarsz tiltani, az EXCLUDED_MATCHUPS listát bővítsd.")
+
+# End of file
