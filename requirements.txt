@@ -5,10 +5,10 @@ python-dotenv==1.0.0
 # HTTP & API Communication
 requests==2.31.0
 feedparser==6.0.11
-aiohttp==3.9.3
+# aiohttp ELTÁVOLÍTVA
 httpx==0.26.0
 
-# Data Manipulation & Analysis (A BOT MAGJA)
+# Data Manipulation & Analysis
 numpy==1.26.2
 pandas==2.1.4
 scipy==1.11.4
@@ -18,7 +18,7 @@ python-dateutil==2.8.2
 pytz==2023.3
 
 # Football Data & APIs
-understat==0.2.5  # 👈 KRITIKUS HIÁNYZÓ CSOMAG
+# understatapi ELTÁVOLÍTVA
 
 # Optional / Likely Needed
 openai==1.6.1
