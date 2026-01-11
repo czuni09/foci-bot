@@ -119,14 +119,18 @@ CONFIG = Config.load()
 missing = []
 if aiohttp is None:
     missing.append("aiohttp")
-if Understat is None:
-    missing.append("understat")
 
 if missing:
     st.title("TITAN – Missing dependencies")
     st.error(f"Hiányzó csomag(ok): {', '.join(missing)}")
     st.code("pip install " + " ".join(missing) + "\n\npip install -r requirements.txt", language="bash")
     st.stop()
+
+if Understat is None:
+    st.warning(
+        "Az Understat nincs telepítve, ezért a meccs‑xG alapú részek kihagyásra kerülnek. "
+        "A többi funkció továbbra is működik."
+    )
 
 # ------------------ Database ------------------
 
