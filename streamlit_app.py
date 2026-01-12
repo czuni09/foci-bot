@@ -8,6 +8,11 @@ import math
 import csv
 import asyncio
 import logging
+import sqlite3
+import time
+import importlib
+import numpy as np
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -75,18 +80,318 @@ WEATHER_API_KEY = _secret("WEATHER_API_KEY")
 ODDS_API_KEY = _secret("ODDS_API_KEY")
 FOOTBALL_DATA_TOKEN = _secret("FOOTBALL_DATA_TOKEN")
 
+# ------------------ Configuration ------------------
+
+@dataclass
+class Config:
+    odds_api_key: str
+    sportmonks_api_key: str
+    news_api_key: str
+    weather_api_key: str
+
+    sportmonks_base_url: str = "https://api.sportmonks.com/v3/football"
+    odds_base_url: str = "https://api.the-odds-api.com/v4"
+    news_base_url: str = "https://newsapi.org/v2"
+    weather_base_url: str = "https://api.openweathermap.org/data/2.5"
+
+    @classmethod
+    def load(cls) -> "Config":
+        return cls(
+            odds_api_key=_secret("ODDS_API_KEY"),
+            sportmonks_api_key=_secret("SPORTMONKS_API_KEY"),
+            news_api_key=_secret("NEWS_API_KEY"),
+            weather_api_key=_secret("WEATHER_API_KEY"),
+        )
+
+    def validate(self) -> bool:
+        return all(
+            [
+                self.odds_api_key,
+                self.sportmonks_api_key,
+                self.news_api_key,
+                self.weather_api_key,
+            ]
+        )
+
+CONFIG = Config.load()
+
 # Early dependency checks that render helpful instructions
 missing = []
 if aiohttp is None:
     missing.append("aiohttp")
-if Understat is None:
-    missing.append("understat")
 
 if missing:
     st.title("TITAN – Missing dependencies")
     st.error(f"Hiányzó csomag(ok): {', '.join(missing)}")
     st.code("pip install " + " ".join(missing) + "\n\npip install -r requirements.txt", language="bash")
     st.stop()
+
+if Understat is None:
+    st.warning(
+        "Az Understat nincs telepítve, ezért a meccs‑xG alapú részek kihagyásra kerülnek. "
+        "A többi funkció továbbra is működik."
+    )
+
+# ------------------ Database ------------------
+
+class Database:
+    def __init__(self, db_path: str = "titan_bot.db") -> None:
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self) -> None:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS picks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id TEXT,
+                home_team TEXT,
+                away_team TEXT,
+                league TEXT,
+                pick_type TEXT,
+                pick_value TEXT,
+                odds REAL,
+                confidence REAL,
+                status TEXT,
+                result TEXT,
+                profit_loss REAL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(match_id, pick_type, pick_value)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS performance (
+                date DATE PRIMARY KEY,
+                total_picks INTEGER DEFAULT 0,
+                wins INTEGER DEFAULT 0,
+                losses INTEGER DEFAULT 0,
+                pushes INTEGER DEFAULT 0,
+                total_stake REAL DEFAULT 0,
+                total_return REAL DEFAULT 0,
+                roi REAL DEFAULT 0
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cache (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                expires DATETIME
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+
+    def save_pick(self, pick_data: Dict[str, Any]) -> bool:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO picks
+                (match_id, home_team, away_team, league, pick_type, pick_value, odds, confidence, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    pick_data.get("match_id"),
+                    pick_data.get("home_team"),
+                    pick_data.get("away_team"),
+                    pick_data.get("league"),
+                    pick_data.get("pick_type"),
+                    pick_data.get("pick_value"),
+                    pick_data.get("odds"),
+                    pick_data.get("confidence"),
+                    pick_data.get("status"),
+                ),
+            )
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as exc:
+            logger.exception("Failed to save pick", exc_info=exc)
+            return False
+
+    def get_performance(self, days: int = 30) -> Dict[str, Any]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN result = 'WIN' THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN result = 'LOSS' THEN 1 ELSE 0 END) as losses,
+                AVG(CASE WHEN result = 'WIN' THEN odds ELSE NULL END) as avg_win_odds,
+                SUM(profit_loss) as total_profit
+            FROM picks
+            WHERE timestamp >= date('now', ?)
+            """,
+            (f"-{days} days",),
+        )
+        result = cursor.fetchone()
+        conn.close()
+        if result and result[0]:
+            win_rate = (result[1] / result[0]) * 100 if result[0] > 0 else 0
+            roi = (result[4] / (result[0] * 10)) * 100 if result[0] > 0 else 0
+            return {
+                "total": result[0],
+                "wins": result[1],
+                "losses": result[2],
+                "win_rate": round(win_rate, 1),
+                "avg_win_odds": round(result[3] or 0, 2),
+                "total_profit": round(result[4] or 0, 2),
+                "roi": round(roi, 1),
+            }
+        return {
+            "total": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0,
+            "avg_win_odds": 0,
+            "total_profit": 0,
+            "roi": 0,
+        }
+
+DB = Database()
+
+# ------------------ API client ------------------
+
+class RateLimiter:
+    def __init__(self, calls_per_minute: int = 30) -> None:
+        self.calls_per_minute = calls_per_minute
+        self.calls: List[float] = []
+
+    async def wait_if_needed(self) -> None:
+        now = time.time()
+        minute_ago = now - 60
+        self.calls = [call for call in self.calls if call > minute_ago]
+        if len(self.calls) >= self.calls_per_minute:
+            wait_time = 60 - (now - self.calls[0])
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+        self.calls.append(now)
+
+
+class SportMonksAPI:
+    def __init__(self) -> None:
+        self.base_url = CONFIG.sportmonks_base_url
+        self.api_key = CONFIG.sportmonks_api_key
+        self.headers = {"Authorization": f"Bearer {self.api_key}"}
+        self.limiter = RateLimiter(10)
+
+    async def get_fixtures(
+        self, date: Optional[str] = None, league_ids: Optional[List[int]] = None
+    ) -> List[Dict[str, Any]]:
+        if not self.api_key:
+            return []
+        await self.limiter.wait_if_needed()
+        if date is None:
+            date = datetime.now().strftime("%Y-%m-%d")
+        url = f"{self.base_url}/fixtures/date/{date}"
+        params: Dict[str, Any] = {"include": "participants;league;referee", "per_page": 50}
+        if league_ids:
+            params["leagues"] = ",".join(map(str, league_ids))
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                headers=self.headers,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return self._process_fixtures(data.get("data", []))
+                logger.warning("SportMonks API error: %s", response.status)
+                return []
+
+    def _process_fixtures(self, fixtures: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        processed = []
+        for fixture in fixtures:
+            participants = fixture.get("participants", [])
+            home_team = participants[0] if len(participants) > 0 else {}
+            away_team = participants[1] if len(participants) > 1 else {}
+            league = fixture.get("league", {})
+            referee = fixture.get("referee", {})
+            stats = {
+                "home_form": ["W", "D", "L", "W", "W"],
+                "away_form": ["L", "W", "D", "L", "W"],
+                "home_xg": 1.8,
+                "away_xg": 1.4,
+                "home_goals_avg": 2.1,
+                "away_goals_avg": 1.3,
+                "home_conceded_avg": 1.2,
+                "away_conceded_avg": 1.8,
+            }
+            processed.append(
+                {
+                    "id": fixture.get("id"),
+                    "date": fixture.get("starting_at"),
+                    "timestamp": fixture.get("starting_at_timestamp"),
+                    "home_team": home_team.get("name", "Unknown"),
+                    "away_team": away_team.get("name", "Unknown"),
+                    "home_id": home_team.get("id"),
+                    "away_id": away_team.get("id"),
+                    "league_id": league.get("id"),
+                    "league_name": league.get("name", "Unknown"),
+                    "league_country": league.get("country", {}).get("name", "Unknown"),
+                    "referee_id": referee.get("id"),
+                    "referee": referee.get("common_name") or referee.get("name", "Unknown"),
+                    "venue": fixture.get("venue", {}).get("name", "Unknown"),
+                    "city": fixture.get("venue", {}).get("city", "Unknown"),
+                    "status": fixture.get("status", {}).get("description", "Scheduled"),
+                    **stats,
+                }
+            )
+        return processed
+
+SPORTMONKS = SportMonksAPI()
+
+# ------------------ Optional Dixon-Coles model ------------------
+
+_dixon_spec = importlib.util.find_spec("dixon_coles_model")
+if _dixon_spec:
+    _dixon_module = importlib.import_module("dixon_coles_model")
+    fit_dixon_coles_model = getattr(_dixon_module, "fit_dixon_coles_model", None)
+    predict_match = getattr(_dixon_module, "predict_match", None)
+else:
+    fit_dixon_coles_model = None
+    predict_match = None
+
+
+class FootballPredictor:
+    def __init__(self) -> None:
+        self.params = None
+        self.teams = None
+        self.xi = 0.0018
+
+    def prepare_data(self, matches_df: pd.DataFrame) -> pd.DataFrame:
+        df = matches_df[["date", "home_team", "away_team", "home_xg", "away_xg"]].copy()
+        df.rename(columns={"home_xg": "home_goals", "away_xg": "away_goals"}, inplace=True)
+        return df
+
+    def train(self, historical_df: pd.DataFrame) -> None:
+        if not fit_dixon_coles_model:
+            raise RuntimeError("Dixon-Coles model is not available.")
+        df = self.prepare_data(historical_df)
+        self.params, self.teams = fit_dixon_coles_model(df, xi=self.xi)
+
+    def predict(self, home_team: str, away_team: str) -> Dict[str, Any]:
+        if not predict_match or self.params is None:
+            raise RuntimeError("Model not trained or unavailable.")
+        pred = predict_match(self.params, self.teams, home_team, away_team)
+        btts_prob = float(np.sum(pred["score_matrix"][1:, 1:]))
+        over25_prob = float(1 - np.sum(pred["score_matrix"][:3, :3]))
+        return {
+            "1X2": (pred["home_win"], pred["draw"], pred["away_win"]),
+            "BTTS": btts_prob,
+            "Over 2.5": over25_prob,
+            "Expected Goals": (pred["expected_home_goals"], pred["expected_away_goals"]),
+        }
 
 # UI styling (kept compact but readable)
 st.markdown("""
